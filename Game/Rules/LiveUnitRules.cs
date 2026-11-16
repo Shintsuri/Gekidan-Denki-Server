@@ -63,7 +63,7 @@ static partial class LiveUnitRules
                 }, checked((int)EffectValue(effect, 1))));
             lights = lights.Concat(additions).ToArray();
             var coolTime = Math.Max(0, I(sense[10]) - (int)passives[member.Slot]
-                .Where(effect => I(effect[1]) == 20).Sum(effect => EffectValue(effect, 1)));
+                .Where(effect => I(effect[1]) is 20 or 21).Sum(effect => EffectValue(effect, 1)));
             var id = (long)member.Slot;
             return new object?[]
             {
