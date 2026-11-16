@@ -2265,6 +2265,15 @@ Start-Process -FilePath '" + AppContext.BaseDirectory + @"SiriusLocalServer.exe'
             return Results.Json(new { ok = true, userId, eventId, partyId, bonus = detail[0], actors = detail[1] });
         });
 
+        // 立即重算曲目解锁（默认会把难度5/OLIVIER 标为已解放）
+        gm.MapGet("/music-unlock-apply", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var changed = await state.UserDataService.ApplyMusicUnlocksAsync(userId);
+            await state.Logger.LogAsync($"gm-music-unlock-apply userId={userId} changed={changed}");
+            return Results.Json(new { ok = true, userId, changed });
+        });
+
         // 相册：重置编成（调试用）
         gm.MapGet("/album/reset", async (HttpContext context) =>
         {

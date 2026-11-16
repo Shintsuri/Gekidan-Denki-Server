@@ -1,7 +1,12 @@
-using Npgsql;
+﻿using Npgsql;
 
 sealed partial class UserDataService
 {
+    // 默认解锁难度 5（OLIVIER）：新账号第一次打开乐曲列表就全部可选，不需要逐曲通关。
+    // 如需恢复官方逐曲解锁，把 WDS_UNLOCK_ALL_DIFFICULTY 设为 0。
+    static readonly bool UnlockAllDifficulties =
+        (Environment.GetEnvironmentVariable("WDS_UNLOCK_ALL_DIFFICULTY") ?? "1").Trim() is not ("0" or "false" or "False");
+
     // 玩家状态行锁由调用方持有，解锁、扣票和结算共用同一事务，避免重试重复消费。
     static async Task<List<object?[]>> SynchronizeMusicUnlocksAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long userId)
     {
@@ -24,6 +29,8 @@ sealed partial class UserDataService
             var owned = (bool)row[9]! || music.OwnershipCondition == 1;
             var stella = MusicUnlockRules.StellaReleased(music,owned,(bool)row[5]!,rank.Rank,olivierCount);
             var status = MusicUnlockRules.OlivierStatus(music,owned,stella,Convert.ToInt32(row[8]),maxClearedLevel);
+            // 默认解锁难度 5：已拥有的歌曲直接把 OLIVIER 标记为已解放（3）
+            if (UnlockAllDifficulties && owned) status = 3;
             if (Equals(row[5],stella) && Equals(row[8],status) && Equals(row[9],owned)) continue;
             row[5]=stella; row[8]=status; row[9]=owned; changed.Add(row);
         }
@@ -155,5 +162,15 @@ sealed partial class UserDataService
             "歌曲兑换成功 operation={Operation} userId={UserId} musicId={MusicId} chartId={ChartId} repeated={Repeated} outcome=success",
             score?"music-score-exchange":"music-exchange",userId,musicId,score?id:0,already);
         return present.ToArray();
+    }
+
+    /// <summary>GM/调试用：立即重算一次曲目解锁状态（含默认解锁难度 5）。</summary>
+    internal async Task<int> ApplyMusicUnlocksAsync(long userId)
+    {
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        var changed = await SynchronizeMusicUnlocksAsync(connection, transaction, userId);
+        await transaction.CommitAsync();
+        return changed.Count;
     }
 }
