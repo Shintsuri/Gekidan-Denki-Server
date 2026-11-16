@@ -80,16 +80,7 @@ static partial class ApiEndpointMappings
         });
 
         // ---- 社团 ----
-        foreach (var path in new[]
-        {
-            "/localap/api/Circles/Expulsion",
-        })
-        {
-            app.MapMethods(path, new[] { "GET", "POST" }, async context =>
-            {
-                await codec.WriteApiResultAsync(context, Ok());
-            });
-        }
+        // Circles/Expulsion 已在 ApiEndpointMappings.CircleOperations.cs 中实现，这里不再覆盖。
         app.MapMethods("/localap/api/Circles/Resignation", new[] { "GET", "POST" }, async context =>
         {
             var present = await state.UserDataService.ResignCircleAsync(context);
