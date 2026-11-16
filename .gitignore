@@ -40,3 +40,5 @@ masterdata-export/
 !**/SCHEMA.md
 !**/SCHEMA.MD
 !devlog/*.md
+!CHANGELOG.md
+!docs/**/*.md
