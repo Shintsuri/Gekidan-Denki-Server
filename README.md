@@ -116,8 +116,6 @@ docs/          进度、逆向记录
 ## 相关项目
 
 - [yumesute-server](https://github.com/Sakurashiyo/yumesute-server)：本项目的上游参考实现
-- [yumesute-preservation-server](https://github.com/Alehero/yumesute-preservation-server)：基于 server-of-dreams 的 Python 实现
-- [yumesute-calc](https://github.com/esterTion/yumesute-calc)：演技力 / 打歌分数计算器
 
 ## 许可与声明
 
