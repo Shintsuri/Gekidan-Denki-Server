@@ -348,4 +348,45 @@ sealed partial class UserDataService
         var records = await ReadPhotoRecordsAsync(connection, userId.Value);
         return records.Where(r => Convert.ToInt64(r[0]) == newId).Cast<object?>().ToArray();
     }
+
+    /// <summary>更换照片能力：把 payload 里的 photoEffectMasterId 换成指定值。</summary>
+    public async Task<object?[]> ChangePhotoAbilityAsync(HttpContext context, long photoId, long effectMasterId)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null || photoId <= 0) return Array.Empty<object?>();
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("""
+            update user_photo_records
+            set payload = payload || jsonb_build_object('photoEffectMasterId', $3), updated_at = now()
+            where id = $1 and "userId" = $2
+            returning id
+            """, connection);
+        command.Parameters.AddWithValue(photoId);
+        command.Parameters.AddWithValue(userId.Value);
+        command.Parameters.AddWithValue(effectMasterId);
+        if (await command.ExecuteScalarAsync() is null) return Array.Empty<object?>();
+        var records = await ReadPhotoRecordsAsync(connection, userId.Value);
+        return records.Where(r => Convert.ToInt64(r[0]) == photoId).Cast<object?>().ToArray();
+    }
+
+    /// <summary>设置照片的角色标签（appeared / tagged）。</summary>
+    public async Task<object?[]> SetPhotoTagsAsync(HttpContext context, long photoId, long[] tags)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null || photoId <= 0) return Array.Empty<object?>();
+        var json = "[" + string.Join(",", tags.Where(t => t > 0).Distinct()) + "]";
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand("""
+            update user_photo_records
+            set payload = payload || jsonb_build_object('tagged', $3::jsonb), updated_at = now()
+            where id = $1 and "userId" = $2
+            returning id
+            """, connection);
+        command.Parameters.AddWithValue(photoId);
+        command.Parameters.AddWithValue(userId.Value);
+        command.Parameters.AddWithValue(json);
+        if (await command.ExecuteScalarAsync() is null) return Array.Empty<object?>();
+        var records = await ReadPhotoRecordsAsync(connection, userId.Value);
+        return records.Where(r => Convert.ToInt64(r[0]) == photoId).Cast<object?>().ToArray();
+    }
 }

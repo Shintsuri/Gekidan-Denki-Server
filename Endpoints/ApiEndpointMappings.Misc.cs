@@ -278,17 +278,38 @@ static partial class ApiEndpointMappings
             await codec.WriteApiResultAsync(context, result);
         });
 
+        // 更换照片能力：payload = [photoId, effectMasterId]
+        app.MapMethods("/localap/api/Photo/ChangePhotoAbility", new[] { "GET", "POST" }, async context =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            var nums = ExtractLongs(body).ToList();
+            var photoId = nums.ElementAtOrDefault(0);
+            var effectId = nums.ElementAtOrDefault(1);
+            await logger.LogAsync($"photo-change-ability photoId={photoId} effect={effectId}");
+            var result = await state.UserDataService.ChangePhotoAbilityAsync(context, photoId, effectId);
+            await codec.WriteApiResultAsync(context, result);
+        });
+
+        // 设置照片角色标签：payload = [photoId, tagId...]
+        app.MapMethods("/localap/api/Photo/SetCharacterBaseTags", new[] { "GET", "POST" }, async context =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            var nums = ExtractLongs(body).ToList();
+            var photoId = nums.ElementAtOrDefault(0);
+            var tags = nums.Skip(1).ToArray();
+            await logger.LogAsync($"photo-set-tags photoId={photoId} tags={string.Join(",", tags)}");
+            var result = await state.UserDataService.SetPhotoTagsAsync(context, photoId, tags);
+            await codec.WriteApiResultAsync(context, result);
+        });
+
         foreach (var path in new[]
         {
             "/localap/api/Photo/AbilityVarietyUp",
             "/localap/api/Photo/AlbumReset",
-            "/localap/api/Photo/ChangePhotoAbility",
             "/localap/api/Photo/Preset/Change/{presetId:long}",
             "/localap/api/Photo/Preset/SetName/{presetId:long}",
             "/localap/api/Photo/SetAlbumPublishing",
-            "/localap/api/Photo/SetCharacterBaseTags",
             "/localap/api/Photo/WatchTheaterStory",
-            "/localap/api/Photos/Sell",
         })
         {
             app.MapMethods(path, new[] { "GET", "POST" }, async context =>
