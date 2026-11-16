@@ -232,14 +232,42 @@ static partial class ApiEndpointMappings
 
         app.MapMethods("/localap/api/Photos/GeneratePhotos", new[] { "GET", "POST" }, async context =>
         {
-            await codec.WriteApiResultAsync(context, new object?[] { GeneratePhotoResult() });
+            var body = await codec.ReadRequestBodyAsync(context);
+            var count = (int)Math.Clamp(ExtractFirstLong(body) ?? 1L, 1L, 10L);
+            var records = await state.UserDataService.GeneratePhotoRecordsAsync(context, 510005L, count);
+            await logger.LogAsync($"photos-generate-photos count={count} created={records.Length}");
+            await codec.WriteApiResultAsync(context, records);
         });
 
         app.MapMethods("/localap/api/Photos/RegeneratePhoto", new[] { "GET", "POST" }, async context =>
         {
-            await codec.WriteApiResultAsync(context, GeneratePhotoResult());
+            var body = await codec.ReadRequestBodyAsync(context);
+            var photoId = ExtractFirstLong(body) ?? 0L;
+            var records = await state.UserDataService.RegeneratePhotoAsync(context, photoId, 510005L);
+            await logger.LogAsync($"photos-regenerate photoId={photoId} created={records.Length}");
+            await codec.WriteApiResultAsync(context, records);
         });
 
+        // 照片图片：客户端会拉 /photo/thumbnail/xxx.jpg，之前没有路由直接 404，相册全是空白。
+        // 服务端没有真实立绘素材，这里返回一张占位 PNG，至少不报错。
+        app.MapGet("/photo/{**path}", async (HttpContext context, string path) =>
+        {
+            var png = Convert.FromBase64String(
+                "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAWklEQVR42u3OMQEAAAgDoC251a3gLwSgOXN2gQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPwYJQABAAHrPQAAAABJRU5ErkJggg==");
+            context.Response.ContentType = "image/png";
+            context.Response.Headers.CacheControl = "public, max-age=3600";
+            await context.Response.Body.WriteAsync(png);
+        });
+        // 照片出售：真正删记录并加金币（之前被 Ok() 覆盖，卖了不掉也不加钱）
+        app.MapMethods("/localap/api/Photos/Sell", new[] { "GET", "POST" }, async context =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            var ids = ExtractLongs(body).ToList();
+            await logger.LogAsync($"photos-sell count={ids.Count} payload={ValueFormatter.Format(body)}");
+            var present = await state.UserDataService.SellPhotosPricedAsync(context, body, ids);
+            await codec.WriteApiFramesAsync(context, new object?[] { true }, present,
+                Array.Empty<object?>(), Array.Empty<object?>(), "five-frame");
+        });
         app.MapMethods("/localap/api/Photos/PhotoLevelUp", new[] { "GET", "POST" }, async context =>
         {
             var body = await codec.ReadRequestBodyAsync(context);

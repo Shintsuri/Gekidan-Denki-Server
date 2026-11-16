@@ -200,7 +200,8 @@ sealed partial class UserDataService
         foreach (var row in eventPointRows) present.Add(row);
         foreach (var character in leveledCharacters) present.Add(DataObject(4, character));
         var result = await BuildLessonFinishResultAsync(connection, userId, session.BaseId, score, judges,
-            previousScore, bestScore, milestones.SelectMany(rule => rule.Rewards).ToArray(), eventResultRow);
+            previousScore, bestScore, milestones.SelectMany(rule => rule.Rewards).ToArray(), eventResultRow,
+            Math.Max(1, (int)(score / 100)));
         var settlement = new LiveSettlement(result, present.ToArray());
         await ExecuteAsync(connection, transaction, "update user_lesson_sessions set completion=$2, finish_hash=$3 where \"userId\"=$1",
             userId, MsgPack.Encode(new object?[] { settlement.Result, settlement.Present }), hash);
@@ -214,7 +215,7 @@ sealed partial class UserDataService
     }
 
     async Task<object?[]> BuildLessonFinishResultAsync(NpgsqlConnection connection, long userId, long baseId, long score,
-        Dictionary<int, int> judges, long before, long after, LessonRules.Reward[] rewards, object?[]? eventResult = null)
+        Dictionary<int, int> judges, long before, long after, LessonRules.Reward[] rewards, object?[]? eventResult = null, int starPointGain = 0)
     {
         var characterBase = (await ReadCharacterBasesAsync(connection, userId)).Single(row => Convert.ToInt64(row[1]) == baseId);
         var achievement = PlayerProgressionRules.Achievement(judges);
@@ -227,6 +228,26 @@ sealed partial class UserDataService
         result[9] = 0; result[10] = 0;
         result[11] = Array.Empty<object?>(); result[12] = Array.Empty<object?>();
         result[13] = (double)achievement; result[20] = 0; result[21] = 0;
+        // 稽古结算同样要填 PlayerRankPointResult（Key 3）：客户端 OnGameResult 会无条件读它，
+        // 之前一直是 null，导致 NullReferenceException，结算界面根本进不去。
+        await using (var playerState = new NpgsqlCommand(
+            "select rank, exp, stamina from user_game_states where \"userId\" = $1", connection))
+        {
+            playerState.Parameters.AddWithValue(userId);
+            await using var playerReader = await playerState.ExecuteReaderAsync();
+            if (await playerReader.ReadAsync())
+            {
+                var playerRank = playerReader.GetInt32(0);
+                var playerExp = playerReader.GetInt32(1);
+                var playerStamina = playerReader.GetInt32(2);
+                result[3] = new object?[] { playerRank, playerRank, playerExp, playerExp, 0, playerStamina };
+            }
+            else result[3] = new object?[] { 1, 1, 0, 0, 0, 0 };
+        }
+        // 稽古结算界面会读 SpRateUpdateResult（Key 16），之前一直是 null，
+        // 客户端拿到 null 后算 SP 面板就崩了。用本次/历史分数填充。
+        result[16] = new object?[] { (int)Math.Min(int.MaxValue, after), (int)Math.Min(int.MaxValue, score),
+            (int)Math.Min(int.MaxValue, after), (int)Math.Min(int.MaxValue, score) };
         // 「楽曲報酬」面板：普通演出用 result[23] 的掉落列表驱动，
         // 稽古之前一直是空数组，所以那个报酬动画不播。这里填成本次稽古拿到的奖励。
         result[23] = rewards
@@ -236,8 +257,14 @@ sealed partial class UserDataService
         // 活动点数面板（普通演出用同一个字段）
         result[22] = eventResult;
         // 尚未实现 SP 加成计算，返回现有等级和点数，避免伪造角色成长。
+        // 稽古会给星点（expGain = score/100），之前这里把 StarPointAcquired 写死成 0，
+        // 客户端拿着「获得 0 星点」却看到等级已变化，结算动画算不下去。
+        var pointAfter = Convert.ToInt32(characterBase[3]);
+        var rankAfter = Convert.ToInt32(characterBase[2]);
+        var pointBefore = Math.Max(0, pointAfter - Math.Max(0, starPointGain));
+        var rankBefore = Math.Min(rankAfter, CharacterMissionRules.Rank(pointBefore));
         result[24] = new object?[] { baseId,
-            new object?[] { characterBase[2], characterBase[2], characterBase[3], characterBase[3], 0, Array.Empty<object?>() },
+            new object?[] { rankBefore, rankAfter, pointBefore, pointAfter, Math.Max(0, starPointGain), Array.Empty<object?>() },
             rewards.Select(reward => (object?)new object?[] { reward.Type, reward.MasterId, reward.Quantity, null, null, null, false }).ToArray(), before, after };
         return result;
     }

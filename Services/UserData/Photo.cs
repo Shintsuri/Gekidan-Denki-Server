@@ -310,4 +310,42 @@ sealed partial class UserDataService
             DataObject(128, await ReadCurrencyAsync(connection, userId.Value))
         };
     }
+
+    /// <summary>批量生成照片（一次多张），每张都写库并返回 Photo 记录。</summary>
+    public async Task<object?[]> GeneratePhotoRecordsAsync(HttpContext context, long itemMasterId, int count)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return Array.Empty<object?>();
+        count = Math.Clamp(count, 1, 10);
+        var created = new List<long>();
+        for (var i = 0; i < count; i++)
+        {
+            var id = await CreatePhotoRecordAsync(context, itemMasterId);
+            if (id > 0) created.Add(id);
+        }
+        if (created.Count == 0) return Array.Empty<object?>();
+        await using var connection = await database.OpenConnectionAsync();
+        var records = await ReadPhotoRecordsAsync(connection, userId.Value);
+        var ids = created.ToHashSet();
+        return records.Where(r => ids.Contains(Convert.ToInt64(r[0]))).Cast<object?>().ToArray();
+    }
+
+    /// <summary>重新生成一张照片：删掉旧的，生成新的同数量记录。</summary>
+    public async Task<object?[]> RegeneratePhotoAsync(HttpContext context, long photoId, long itemMasterId)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return Array.Empty<object?>();
+        await using var connection = await database.OpenConnectionAsync();
+        await using (var del = new NpgsqlCommand(
+            "delete from user_photo_records where id = $1 and \"userId\" = $2", connection))
+        {
+            del.Parameters.AddWithValue(photoId);
+            del.Parameters.AddWithValue(userId.Value);
+            await del.ExecuteNonQueryAsync();
+        }
+        var newId = await CreatePhotoRecordAsync(context, itemMasterId);
+        if (newId <= 0) return Array.Empty<object?>();
+        var records = await ReadPhotoRecordsAsync(connection, userId.Value);
+        return records.Where(r => Convert.ToInt64(r[0]) == newId).Cast<object?>().ToArray();
+    }
 }
