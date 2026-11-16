@@ -1553,10 +1553,13 @@ static class DatabaseMigrator
       released_episode integer not null default 0,
       item_consume_break_through_count integer not null default 0,
       is_favorite boolean not null default false,
-      alternative_image_pattern integer not null default 0
+      alternative_image_pattern integer not null default 0,
+      updated_at timestamptz not null default now()
     );
 
     create index if not exists user_posters_user_idx on user_posters("userId");
+    -- 旧库补列（UpsertPosterAsync / 收藏海报都会写 updated_at）
+    alter table user_posters add column if not exists updated_at timestamptz not null default now();
 
     create table if not exists user_accessories (
       id bigserial primary key,

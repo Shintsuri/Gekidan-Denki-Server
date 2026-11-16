@@ -44,6 +44,7 @@ options.Listen(address, config.Port, listener => listener.Protocols = Microsoft.
         listener.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2);
 });
 builder.Services.AddSingleton(state);
+builder.Services.AddHostedService<EventSettlementService>();
 builder.Services.AddGrpc(options => options.MaxReceiveMessageSize = 64 * 1024);
 builder.Services.AddSingleton<Grpc.AspNetCore.Server.Model.IServiceMethodProvider<RealtimeHubService>, RealtimeHubMethodProvider>();
 

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 /// <summary>
 /// 活动编成加成。三类来源：
@@ -180,6 +180,63 @@ static class EventBonusRules
                     bonus += 0.25m;
             }
         }
-        return bonus;
+        // 客户端还有两处 Sum<float>（海报/饰品系小加成），用配置精确补上
+        return bonus + ExtraBonus(eventMasterId);
     }
+
+    /// <summary>调试用：返回每个角色的加成明细，便于和客户端显示对照。</summary>
+    public static object?[] Describe(long eventMasterId, IEnumerable<ActorEntry> actors)
+    {
+        var rows = BonusRows.Where(row => row.EventMasterId == eventMasterId).ToArray();
+        var eventAttribute = EventAttributes.GetValueOrDefault(eventMasterId);
+        var list = new List<object?>();
+        foreach (var entry in actors.Where(a => a.BaseId > 0).Distinct().Take(5))
+        {
+            var company = BaseCompanies.GetValueOrDefault(entry.BaseId);
+            var cardAttribute = CardAttributes.GetValueOrDefault(entry.CardMasterId);
+            var companyHits = rows.Count(row => row.Type == 1 && company != 0 && company == row.Value);
+            var characterHits = rows.Count(row => row.Type == 2 && entry.BaseId == row.Value);
+            var attributeHit = eventAttribute != 0 && cardAttribute == eventAttribute;
+            var bonus = (companyHits + characterHits) * 0.25m + (attributeHit ? 0.25m : 0m);
+            list.Add(new object?[]
+            {
+                entry.BaseId, entry.CardMasterId, company, cardAttribute,
+                companyHits, characterHits, attributeHit, bonus
+            });
+        }
+        return list.ToArray();
+    }
+
+    /// <summary>
+    /// 客户端 GetEventBonusValue 的额外求和项（反汇编确认的两处 Enumerable.Sum&lt;float&gt;）。
+    /// 这两项来自海报/饰品系的小百分比加成，主数据里没有独立表可解析；
+    /// 这里用配置文件 event_bonus_extra.json 精确补上，格式：{ "20005": 3.5 }（单位：百分点）。
+    /// </summary>
+    static readonly Lazy<Dictionary<long, decimal>> ExtraBonuses = new(LoadExtraBonuses);
+
+    static Dictionary<long, decimal> LoadExtraBonuses()
+    {
+        var map = new Dictionary<long, decimal>();
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "event_bonus_extra.json");
+            if (!File.Exists(path)) return map;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (!long.TryParse(property.Name, out var eventId)) continue;
+                if (property.Value.ValueKind != JsonValueKind.Number) continue;
+                map[eventId] = property.Value.GetDecimal() / 100m;
+            }
+        }
+        catch
+        {
+            // 配置坏了就当没有额外加成
+        }
+        return map;
+    }
+
+    public static decimal ExtraBonus(long eventMasterId) =>
+        ExtraBonuses.Value.TryGetValue(eventMasterId, out var value) ? value : 0m;
 }
+

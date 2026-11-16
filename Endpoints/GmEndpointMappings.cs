@@ -2220,9 +2220,190 @@ Start-Process -FilePath '" + AppContext.BaseDirectory + @"SiriusLocalServer.exe'
             return Results.Json(new { ok = true, enabled = options.Enabled, days = options.Days });
         });
 
+        // 通用奖励发放：thingType/thingId/quantity 直接发放（调试 + 补发都可用）
+        gm.MapGet("/reward/grant", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var thingType = ReadInt(context, "thingType") ?? 1;
+            var thingId = (long)(ReadInt(context, "thingId") ?? 0);
+            var quantity = ReadInt(context, "quantity") ?? 1;
+            if (thingId <= 0 || quantity <= 0) return Results.Json(new { ok = false, error = "bad-args" });
+
+            await using var connection = await state.Database.OpenConnectionAsync();
+            await using var transaction = await connection.BeginTransactionAsync();
+            var present = await UserDataService.GrantRewardThingAsync(connection, transaction, userId, thingType, thingId, quantity);
+            await transaction.CommitAsync();
+            await state.Logger.LogAsync($"gm-reward-grant user={userId} type={thingType} id={thingId} qty={quantity}");
+            return Results.Json(new { ok = true, userId, thingType, thingId, quantity, hasPresent = present is not null });
+        });
+
+        // 星等级奖励补发：把 base 的 1..rank 未领档位全部补发
+        gm.MapGet("/reward/star-rank", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var baseId = long.Parse(context.Request.Query["baseId"].ToString());
+            var rank = ReadInt(context, "rank") ?? 0;
+            if (baseId <= 0 || rank <= 0) return Results.Json(new { ok = false, error = "bad-args" });
+
+            await using var connection = await state.Database.OpenConnectionAsync();
+            await using var transaction = await connection.BeginTransactionAsync();
+            var grant = await UserDataService.GrantStarRankRewardsAsync(connection, transaction, userId, baseId, rank);
+            await transaction.CommitAsync();
+            await state.Logger.LogAsync($"gm-reward-star-rank user={userId} base={baseId} rank={rank} ranks={grant.Ranks} things={grant.Things.Count}");
+            return Results.Json(new { ok = true, userId, baseId, rank, grantedRanks = grant.Ranks, grantedThings = grant.Things.Count });
+        });
+
+        // 编成加成明细（服务端口径）：用于和客户端显示对照
+        gm.MapGet("/event-bonus", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var eventId = (long)(ReadInt(context, "eventId") ?? 0);
+            var partyId = (long)(ReadInt(context, "partyId") ?? 1004001);
+            if (eventId == 0) eventId = ActiveEventIdFromFile();
+            if (eventId == 0) return Results.Json(new { ok = false, error = "no-event" });
+            var detail = await state.UserDataService.DescribeEventBonusAsync(userId, eventId, partyId);
+            return Results.Json(new { ok = true, userId, eventId, partyId, bonus = detail[0], actors = detail[1] });
+        });
+
+        // 相册：重置编成（调试用）
+        gm.MapGet("/album/reset", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var albumGroupId = (long)(ReadInt(context, "albumGroupId") ?? 1);
+            var arrangementType = ReadInt(context, "arrangementType") ?? 1;
+            var result = await state.UserDataService.ResetPhotoAlbumAsync(userId, albumGroupId, arrangementType);
+            return Results.Json(new { ok = true, userId, albumGroupId, arrangementType, result });
+        });
+
+        // 三連劇：加积分 / 结算
+        gm.MapGet("/triple-cast/point", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var tripleCastId = (long)(ReadInt(context, "tripleCastId") ?? 0);
+            var points = ReadInt(context, "points") ?? 0;
+            if (tripleCastId <= 0 || points == 0) return Results.Json(new { ok = false, error = "bad-args" });
+            await using var connection = await state.Database.OpenConnectionAsync();
+            await using var transaction = await connection.BeginTransactionAsync();
+            var total = await UserDataService.AddTripleCastPointsAsync(connection, transaction, userId, tripleCastId, points);
+            await transaction.CommitAsync();
+            return Results.Json(new { ok = true, userId, tripleCastId, points, total });
+        });
+
+        gm.MapGet("/triple-cast/settle", async (HttpContext context) =>
+        {
+            var tripleCastId = (long)(ReadInt(context, "tripleCastId") ?? 0);
+            if (tripleCastId <= 0) return Results.Json(new { ok = false, error = "bad-args" });
+            await using var connection = await state.Database.OpenConnectionAsync();
+            var (settled, ranked, rewarded) = await UserDataService.SettleTripleCastAsync(connection, tripleCastId);
+            return Results.Json(new { ok = true, tripleCastId, settled, ranked, rewarded });
+        });
+
+        // リーグ：加积分 / 结算 / 查看状态（调试与补发用）
+        gm.MapGet("/league/point", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var leagueId = (long)(ReadInt(context, "leagueId") ?? 0);
+            var points = ReadInt(context, "points") ?? 0;
+            if (leagueId <= 0 || points == 0) return Results.Json(new { ok = false, error = "bad-args" });
+            await using var connection = await state.Database.OpenConnectionAsync();
+            await using var transaction = await connection.BeginTransactionAsync();
+            var total = await UserDataService.AddLeaguePointsAsync(connection, transaction, userId, leagueId, points);
+            await transaction.CommitAsync();
+            return Results.Json(new { ok = true, userId, leagueId, points, total });
+        });
+
+        gm.MapGet("/league/settle", async (HttpContext context) =>
+        {
+            var leagueId = (long)(ReadInt(context, "leagueId") ?? 0);
+            var classType = ReadInt(context, "class") ?? 3;
+            if (leagueId <= 0) return Results.Json(new { ok = false, error = "bad-args" });
+            await using var connection = await state.Database.OpenConnectionAsync();
+            var (settled, ranked, rewarded) = await UserDataService.SettleLeagueAsync(connection, leagueId, classType);
+            return Results.Json(new { ok = true, leagueId, classType, settled, ranked, rewarded });
+        });
+
+        gm.MapGet("/league/state", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            await using var connection = await state.Database.OpenConnectionAsync();
+            await UserDataService.EnsureLeagueRewardTablesAsync(connection);
+            var list = new List<object>();
+            await using var command = new NpgsqlCommand(
+                """
+                select league_master_id, class_type, point, rank
+                from user_league_states
+                where "userId" = $1
+                order by league_master_id desc
+                """, connection);
+            command.Parameters.AddWithValue(userId);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                list.Add(new { leagueId = reader.GetInt64(0), classType = reader.GetInt32(1), point = reader.GetInt64(2), rank = reader.GetInt32(3) });
+            return Results.Json(new { ok = true, userId, states = list });
+        });
+
+        // 活动奖励：手动补发累计 PT 档位 / 强制结算排名（GM 调试与修复用）
+        gm.MapGet("/event-reward/grant", async (HttpContext context) =>
+        {
+            var userId = (long)(ReadInt(context, "userId") ?? 1);
+            var eventId = (long)(ReadInt(context, "eventId") ?? 0);
+            if (eventId == 0) eventId = ActiveEventIdFromFile();
+            if (eventId == 0) return Results.Json(new { ok = false, error = "no-event" });
+
+            await using var connection = await state.Database.OpenConnectionAsync();
+            long point;
+            await using (var command = new NpgsqlCommand(
+                """
+                select point from user_story_event_states
+                where "userId" = $1 and event_master_id = $2
+                """, connection))
+            {
+                command.Parameters.AddWithValue(userId);
+                command.Parameters.AddWithValue(eventId);
+                point = await command.ExecuteScalarAsync() is long value ? value : 0L;
+            }
+
+            await using var transaction = await connection.BeginTransactionAsync();
+            var grant = await UserDataService.GrantEventTotalPointRewardsAsync(connection, transaction, userId, eventId, point);
+            await transaction.CommitAsync();
+            await state.Logger.LogAsync($"gm-event-reward-grant userId={userId} eventId={eventId} point={point} received={grant.ReceivedOrder}");
+            return Results.Json(new
+            {
+                ok = true, userId, eventId, point,
+                receivedOrder = grant.ReceivedOrder, dropCount = grant.Drops.Length
+            });
+        });
+
+        gm.MapPost("/event-reward/settle", async (HttpContext context) =>
+        {
+            var eventId = (long)(ReadInt(context, "eventId") ?? 0);
+            if (eventId == 0) eventId = ActiveEventIdFromFile();
+            if (eventId == 0) return Results.Json(new { ok = false, error = "no-event" });
+
+            await using var connection = await state.Database.OpenConnectionAsync();
+            var result = await UserDataService.SettleStoryEventRankingAsync(connection, eventId, DateTime.UtcNow);
+            await state.Logger.LogAsync($"gm-event-reward-settle eventId={eventId} settled={result.Settled} {result.Detail}");
+            return Results.Json(new { ok = true, eventId, settled = result.Settled, detail = result.Detail });
+        });
+
     }
 
-    // 所有带 "userId" 列的 public 表
+    static long ActiveEventIdFromFile()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "active_events.json");
+            if (!File.Exists(path)) return 0;
+            using var document = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            foreach (var item in document.RootElement.EnumerateArray())
+                if (item.TryGetInt64(out var eventId)) return eventId;
+        }
+        catch
+        {
+            // 配置坏了就当没有活动
+        }
+        return 0;
+    }
     static async Task<List<string>> ListUserTablesAsync(NpgsqlConnection connection)
     {
         await using var command = new NpgsqlCommand("""
@@ -3961,3 +4142,4 @@ static class GmLoginPage
 </html>
 """;
 }
+

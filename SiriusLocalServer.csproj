@@ -22,9 +22,16 @@
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <EmbeddedResource Include="masterdata-export/tables/AuditionMaster.json" LogicalName="Competition.AuditionMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/LeagueMaster.json" LogicalName="Competition.LeagueMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/LeagueRewardPackageMaster.json" LogicalName="Competition.LeagueRewardPackageMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/LeaguePlayRewardPackageMaster.json" LogicalName="Competition.LeaguePlayRewardPackageMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/LeagueGroupRankingRewardPackageMaster.json" LogicalName="Competition.LeagueGroupRankingRewardPackageMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/PhotoLevelUpItemGroupMaster.json" LogicalName="Photo.PhotoLevelUpItemGroupMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/StoryEventBonusCharacterBaseMaster.json" LogicalName="Event.StoryEventBonusCharacterBaseMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/StoryEventTotalPointRewardMaster.json" LogicalName="Event.StoryEventTotalPointRewardMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/StoryEventRewardMaster.json" LogicalName="Event.StoryEventRewardMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/StoryEventRewardItemPackage.json" LogicalName="Event.StoryEventRewardItemPackage.json" />
     <EmbeddedResource Include="masterdata-export/tables/TripleCastMaster.json" LogicalName="Competition.TripleCastMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/TripleCastGroupRankingRewardPackageMaster.json" LogicalName="Competition.TripleCastGroupRankingRewardPackageMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/AuditionPhaseMaster.json" LogicalName="Competition.AuditionPhaseMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/AuditionRewardPackageMaster.json" LogicalName="Competition.AuditionRewardPackageMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/StampMaster.json" LogicalName="Realtime.StampMaster.json" />
@@ -75,6 +82,8 @@
     <EmbeddedResource Include="masterdata-export/tables/CharacterMissionCategoryLevelMaster.json" LogicalName="CharacterMission.CharacterMissionCategoryLevelMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/CharacterKeyMissionMaster.json" LogicalName="CharacterMission.CharacterKeyMissionMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/CharacterStarRankMaster.json" LogicalName="CharacterMission.CharacterStarRankMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/StarRankRewardMaster.json" LogicalName="CharacterMission.StarRankRewardMaster.json" />
+    <EmbeddedResource Include="masterdata-export/tables/CharacterStarRankRewardGroupMaster.json" LogicalName="CharacterMission.CharacterStarRankRewardGroupMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/CharacterSenseEnhanceItemGroupMaster.json" LogicalName="Progression.CharacterSenseEnhanceItemGroupMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/CharacterMaster.json" LogicalName="InventoryMaster.CharacterMaster.json" />
     <EmbeddedResource Include="masterdata-export/tables/CharacterBaseMaster.json" LogicalName="InventoryMaster.CharacterBaseMaster.json" />

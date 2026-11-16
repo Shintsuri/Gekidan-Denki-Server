@@ -2079,7 +2079,8 @@ async Task<List<object?[]>> ReadActiveEventStatesAsync(NpgsqlConnection connecti
                 140,
                 new object?[]
                 {
-                    UserScopedId(userId, 140000 + id), id, p.Item1, 0
+                    UserScopedId(userId, 140000 + id), id, p.Item1,
+                    await ReadReceivedTotalPointOrderAsync(connection, userId, id)
                 }
             });
         }

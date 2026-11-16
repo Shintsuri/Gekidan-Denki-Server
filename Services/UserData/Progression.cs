@@ -287,6 +287,11 @@ sealed partial class UserDataService
         // 不再向普通演出注入抓包里的活动、试镜和任务进度。
         // 活动点数：若 GM 开启了活动，打歌按分数累加活动点数
         var eventPointRows = new List<object?[]>();
+        // 活动累计 PT 奖励：达到档位立即发放（官方逻辑），奖励同时进结算面板与 present
+        var eventRewardDrops = new List<object?>();
+        var eventRewardPresent = new List<object?[]>();
+        // 演劇リーグ：参加奖励 + 积分累计（积分口径：分数/10000，至少 1 分）
+        var leaguePresent = new List<object?>();
         // 结算界面「活动PT」面板由 FinishLiveResult.EventResult 驱动：
         //   [0] 本局获得的活动点数  [1] 活动 ID  [2] 社团最高分  [3] 倍率
         // 该字段为 null 时客户端不会显示活动点数面板。
@@ -305,6 +310,7 @@ sealed partial class UserDataService
                     var eventBonus = ReadEventFormationBonus(snapshot.Unit, eventId);
                     var eventGain = EventPointRules.Calculate(
                         score, snapshot.BaseStamina, snapshot.EffectiveMagnification, eventBonus);
+                    Console.WriteLine($"[event-bonus] user={userId} event={eventId} bonus={eventBonus:0.00} gain={eventGain} score={score} stamina={snapshot.BaseStamina} boost={snapshot.EffectiveMagnification}");
                     await using (var upsert = new NpgsqlCommand("""
                         insert into user_story_event_states(id, "userId", event_master_id, point)
                         values ($1, $2, $3, $4)
@@ -318,6 +324,27 @@ sealed partial class UserDataService
                         upsert.Parameters.AddWithValue(eventId);
                         upsert.Parameters.AddWithValue(eventGain);
                         var total = Convert.ToInt64(await upsert.ExecuteScalarAsync());
+                        // 奖励发放失败不能拖垮整场演出结算：用 savepoint 单独回滚
+                        await transaction.SaveAsync("event_reward_grant");
+                        EventTotalPointGrant? eventGrant = null;
+                        try
+                        {
+                            eventGrant = await GrantEventTotalPointRewardsAsync(
+                                connection, transaction, userId, eventId, total);
+                        }
+                        catch (Exception rewardError)
+                        {
+                            await transaction.RollbackAsync("event_reward_grant");
+                            context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                                .LogWarning("event reward grant failed event={EventId} error={Error}", eventId, rewardError.Message);
+                        }
+                        var receivedOrder = eventGrant?.ReceivedOrder
+                            ?? await ReadReceivedTotalPointOrderAsync(connection, transaction, userId, eventId);
+                        if (eventGrant is not null)
+                        {
+                            eventRewardDrops.AddRange(eventGrant.Drops);
+                            eventRewardPresent.AddRange(eventGrant.Present.Cast<object?[]>());
+                        }
                         eventPointRows.Add(new object?[]
                         {
                             101,
@@ -330,7 +357,7 @@ sealed partial class UserDataService
                         eventPointRows.Add(new object?[]
                         {
                             140,
-                            new object?[] { UserScopedId(userId, 140000 + eventId), eventId, total, 0 }
+                            new object?[] { UserScopedId(userId, 140000 + eventId), eventId, total, receivedOrder }
                         });
                         // 交换所消耗的是该期的 PT 硬币道具，点数必须同时记到道具上
                         if (EventPtCoins.Map.TryGetValue(eventId, out var ptCoinId))
@@ -354,6 +381,47 @@ sealed partial class UserDataService
         {
             context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
                 .LogWarning("活动点数累加失败 error={Error}", eventError.Message);
+        }
+
+        // 演劇リーグ：这局按分数累计リーグ积分，并发放参加奖励（LeaguePlayRewardPackageMaster）
+        try
+        {
+            if (GameResults.IsLeagueLive())
+            {
+                var period = CurrentLeaguePeriod();
+                if (period is not null)
+                {
+                    var leaguePoints = Math.Max(1, (int)(score / 10000));
+                    await AddLeaguePointsAsync(connection, transaction, userId, period.Id, leaguePoints, period.ClassType);
+                    await GrantLeaguePlayRewardAsync(connection, transaction, userId, period.Id, leaguePresent);
+                    context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                        .LogInformation("league play userId={UserId} league={LeagueId} points={Points}", userId, period.Id, leaguePoints);
+                }
+            }
+        }
+        catch (Exception leagueError)
+        {
+            context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                .LogWarning("リーグ结算失败 error={Error}", leagueError.Message);
+        }
+
+        // 三連劇：这局按分数累计积分（期间结束后统一结算排名奖励）
+        try
+        {
+            if (GameResults.IsTripleCastLive())
+            {
+                var period = CurrentTripleCastPeriod();
+                if (period is not null)
+                {
+                    var tripleCastPoints = Math.Max(1, (int)(score / 10000));
+                    await AddTripleCastPointsAsync(connection, transaction, userId, period.Id, tripleCastPoints);
+                }
+            }
+        }
+        catch (Exception tripleCastError)
+        {
+            context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                .LogWarning("三連劇结算失败 error={Error}", tripleCastError.Message);
         }
 
         var result = new object?[31];
@@ -399,6 +467,8 @@ sealed partial class UserDataService
                 drop.FrameId, 0, true
             });
         if (coins > 0) drops.Add(new object?[] { new object?[] { 12, 0, coins, null, null, null, false }, 0, 0, false });
+        // 活动累计 PT 奖励并入乐曲报酬面板，玩家打歌达标时当场看到
+        drops.AddRange(eventRewardDrops);
         result[23] = drops.ToArray();
         result[2] = new object?[] { new object?[] { bestAchievement, (double)achievement }, new object?[] { bestNotation, (double)notation }, beforeRating, rating };
         result[3] = new object?[] { state.Rank, next.Rank, state.Exp, next.Exp, gain, snapshot.Ordinary ? snapshot.StaminaBefore : state.Stamina };
@@ -452,6 +522,10 @@ sealed partial class UserDataService
         present.Add(DataObject(130,await ReadLiveAchievementAsync(connection,userId)));
         // 活动点数变化也作为 present 下发
         foreach (var row in eventPointRows) present.Add(row);
+        // 活动累计 PT 奖励发放后的道具/货币状态
+        foreach (var row in eventRewardPresent) present.Add(row);
+        // リーグ参加奖励
+        foreach (var row in leaguePresent) present.Add(row!);
 
         var settlement = new LiveSettlement(result,present.ToArray());
         await ExecuteAsync(connection, transaction,

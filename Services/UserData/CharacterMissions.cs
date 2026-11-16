@@ -145,6 +145,9 @@ sealed partial class UserDataService
             await ExecuteAsync(connection,transaction,"""
                 update user_character_bases set exp=$3,rank=$4,level=$5 where "userId"=$1 and character_base_master_id=$2
                 """,userId,id,total,rank,keyLevel);
+            // 星等级提升 → 补发该档位的星等级奖励
+            if (rank > Convert.ToInt32(before[2]))
+                await GrantStarRankRewardsAsync(connection, transaction, userId, id, rank);
             var after = (object?[])before.Clone(); after[2]=rank; after[3]=total; after[5]=keyLevel;  // 对齐 CharacterBase
             present.Add(DataObject(5,after));
             foreach (var state in updated)

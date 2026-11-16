@@ -80,6 +80,39 @@ static partial class ApiEndpointMappings
         });
 
         // ---- 社团 ----
+        // StarRank 奖励领取：奖励已在 rank 提升时补发到背包，这里只需确认领取成功，
+        // 让客户端的领取按钮有响应。多个候选路径都注册，兼容不同版本客户端。
+        foreach (var path in new[]
+        {
+            "/localap/api/CharacterBases/{baseId:long}/ReceiveStarRankReward",
+            "/localap/api/Characters/{characterId:long}/ReceiveStarRankReward",
+            "/localap/api/Character/ReceiveStarRankReward",
+            "/localap/api/Characters/ReceiveStarRankReward",
+            "/localap/api/StarRankRewards/Receive",
+        })
+        {
+            app.MapMethods(path, new[] { "GET", "POST" }, async context =>
+            {
+                await logger.LogAsync($"star-rank-reward-receive path={context.Request.Path} query={context.Request.QueryString}");
+                var id = 0L;
+                foreach (var key in new[] { "baseId", "characterId" })
+                {
+                    if (context.Request.RouteValues.TryGetValue(key, out var routeValue) && routeValue is not null
+                        && long.TryParse(routeValue.ToString(), out var parsed))
+                    {
+                        id = parsed;
+                        break;
+                    }
+                }
+                if (id == 0)
+                {
+                    foreach (var key in new[] { "baseId", "characterBaseMasterId", "characterId" })
+                        if (long.TryParse(context.Request.Query[key].ToString(), out var parsed)) { id = parsed; break; }
+                }
+                var starRankRewards = await state.UserDataService.ReceiveStarRankRewardsAsync(context, id);
+                await codec.WriteApiResultAsync(context, starRankRewards);
+            });
+        }
         // Circles/Expulsion 已在 ApiEndpointMappings.CircleOperations.cs 中实现，这里不再覆盖。
         app.MapMethods("/localap/api/Circles/Resignation", new[] { "GET", "POST" }, async context =>
         {
@@ -293,20 +326,47 @@ static partial class ApiEndpointMappings
             await codec.WriteApiResultAsync(context, result);
         });
 
-        foreach (var path in new[]
+        // 相册：重置 / 公开设置 / 预设（之前全是 Ok() 假返回）
+        app.MapMethods("/localap/api/Photo/AlbumReset", new[] { "GET", "POST" }, async context =>
         {
-            "/localap/api/Photo/AbilityVarietyUp",
-            "/localap/api/Photo/AlbumReset",
-            "/localap/api/Photo/Preset/Change/{presetId:long}",
-            "/localap/api/Photo/Preset/SetName/{presetId:long}",
-            "/localap/api/Photo/SetAlbumPublishing",
-            "/localap/api/Photo/WatchTheaterStory",
-        })
+            var body = await codec.ReadRequestBodyAsync(context);
+            await logger.LogAsync($"photo-album-reset payload={ValueFormatter.Format(body)}");
+            await codec.WriteApiResultAsync(context, await state.UserDataService.ResetPhotoAlbumAsync(context, body));
+        });
+
+        app.MapMethods("/localap/api/Photo/SetAlbumPublishing", new[] { "GET", "POST" }, async context =>
         {
-            app.MapMethods(path, new[] { "GET", "POST" }, async context =>
-            {
-                await codec.WriteApiResultAsync(context, Ok());
-            });
-        }
+            var body = await codec.ReadRequestBodyAsync(context);
+            await logger.LogAsync($"photo-album-publishing payload={ValueFormatter.Format(body)}");
+            await codec.WriteApiResultAsync(context, await state.UserDataService.SetPhotoAlbumPublishingAsync(context, body));
+        });
+
+        app.MapMethods("/localap/api/Photo/Preset/Change/{presetId:long}", new[] { "GET", "POST" }, async (HttpContext context, long presetId) =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            await logger.LogAsync($"photo-preset-change preset={presetId} payload={ValueFormatter.Format(body)}");
+            await codec.WriteApiResultAsync(context, await state.UserDataService.SavePhotoPresetAsync(context, presetId, body, false));
+        });
+
+        app.MapMethods("/localap/api/Photo/Preset/SetName/{presetId:long}", new[] { "GET", "POST" }, async (HttpContext context, long presetId) =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            await logger.LogAsync($"photo-preset-name preset={presetId} payload={ValueFormatter.Format(body)}");
+            await codec.WriteApiResultAsync(context, await state.UserDataService.SavePhotoPresetAsync(context, presetId, body, true));
+        });
+
+        app.MapMethods("/localap/api/Photo/WatchTheaterStory", new[] { "GET", "POST" }, async context =>
+        {
+            var body = await codec.ReadRequestBodyAsync(context);
+            await logger.LogAsync($"photo-watch-theater-story payload={ValueFormatter.Format(body)}");
+            await codec.WriteApiResultAsync(context, await state.UserDataService.WatchTheaterStoryAsync(context, body));
+        });
+
+        app.MapMethods("/localap/api/Photo/AbilityVarietyUp", new[] { "GET", "POST" }, async context =>
+        {
+            // 客户端没有发过这个请求，payload 语义未知：先记录，等抓到真实报文再实现
+            await logger.LogAsync($"photo-ability-variety-up payload={ValueFormatter.Format(await codec.ReadRequestBodyAsync(context))}");
+            await codec.WriteApiResultAsync(context, Ok());
+        });
     }
 }

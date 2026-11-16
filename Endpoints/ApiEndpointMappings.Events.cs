@@ -127,8 +127,23 @@ static partial class ApiEndpointMappings
 
         app.MapMethods("/localap/api/Events/GetTotalPointEventInformation", new[] { "GET", "POST" }, async context =>
         {
-            await codec.WriteApiResultAsync(context, new object?[] { 0L, 0L });
+            await codec.WriteApiResultAsync(context, await state.UserDataService.ReadTotalPointEventInformationAsync(context));
         });
+
+        // 累计 PT 奖励领取：官方界面有「受け取る」按钮。奖励已按“达到即发放”实时进背包，
+        // 这里做成幂等补发，客户端点了也不会重复给（已发档位有记录）。
+        foreach (var path in new[]
+        {
+            "/localap/api/Events/ReceiveTotalPointReward/{eventMasterId:long?}",
+            "/localap/api/Events/ReceiveTotalPointEventReward/{eventMasterId:long?}",
+        })
+        {
+            app.MapMethods(path, new[] { "GET", "POST" }, async (HttpContext context, long? eventMasterId) =>
+            {
+                await logger.LogAsync($"events-receive-total-point-reward eventId={eventMasterId} query={context.Request.QueryString}");
+                await codec.WriteApiResultAsync(context, await state.UserDataService.ReceiveTotalPointRewardsAsync(context, eventMasterId ?? 0));
+            });
+        }
 
         // 角色点数活动
         foreach (var path in new[]

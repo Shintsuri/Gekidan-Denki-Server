@@ -8,6 +8,21 @@
 
 本项目未按语义化版本管理，阶段性记录如下。
 
+## 2026-11-17
+
+### 新增
+- 统一奖励发放（`RewardGrant`）：道具/角色卡/海报/饰品/服装/称号/金币/免费石/乐曲/体力/主页皮肤
+- 星等级奖励（`StarRankRewards`）：星等级提升自动补发，客户端 `ReceiveStarRankReward` 真实领取
+- 活动累计 PT 奖励：打歌/稽古达到档位立即发放（savepoint 隔离，失败不影响结算）
+- 活动排名奖励：结算期结束（`StoryEventMaster.ForceEndDate`）按最终排名发放，每期只结算一次
+- 演劇リーグ / 三連劇：参加奖励 + 期间结束排名奖励（`LeagueRewards` / `TripleCastRewards`）
+- 摄影相册：`AlbumReset` / `SetAlbumPublishing` / `Preset/Change` / `Preset/SetName` / `WatchTheaterStory`
+- GM 调试接口：`/gm/event-bonus`、`/gm/reward/grant`、`/gm/reward/star-rank`、`/gm/league/*`、`/gm/triple-cast/*`
+
+### 修复
+- `user_posters` 缺少 `updated_at` 列导致海报发放/收藏 500
+- 结算服务建表标记在事务回滚后不一致的问题（改为幂等建表）
+- 活动编成加成与客户端 `GetEventBonusValue` 对齐（额外加成可用 `event_bonus_extra.json` 标定）
 ## 未发布
 
 ### 修复

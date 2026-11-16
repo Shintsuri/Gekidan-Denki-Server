@@ -1,4 +1,4 @@
-using Npgsql;
+﻿using Npgsql;
 
 sealed partial class UserDataService
 {
@@ -388,5 +388,137 @@ sealed partial class UserDataService
         if (await command.ExecuteScalarAsync() is null) return Array.Empty<object?>();
         var records = await ReadPhotoRecordsAsync(connection, userId.Value);
         return records.Where(r => Convert.ToInt64(r[0]) == photoId).Cast<object?>().ToArray();
+    }
+
+    /// <summary>相册重置：清空该相册编成的布局（保留公开设置）。</summary>
+    internal async Task<object?[]> ResetPhotoAlbumAsync(long userId, long albumGroupId, int arrangementType)
+    {
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            update user_photo_album_arrangements
+            set layout_payload = $4, updated_at = now()
+            where "userId" = $1 and album_group_id = $2 and arrangement_type = $3
+            """, connection);
+        command.Parameters.AddWithValue(userId);
+        command.Parameters.AddWithValue(albumGroupId);
+        command.Parameters.AddWithValue(arrangementType);
+        command.Parameters.AddWithValue(MsgPack.Encode(Array.Empty<object?>()));
+        var changed = await command.ExecuteNonQueryAsync();
+        return new object?[] { changed >= 0 };
+    }
+
+    /// <summary>相册公开设置。</summary>
+    internal async Task<object?[]> SetPhotoAlbumPublishingAsync(long userId, long albumGroupId, int arrangementType, bool isPublic)
+    {
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            insert into user_photo_album_arrangements(id, "userId", album_group_id, arrangement_type, is_public, layout_payload, updated_at)
+            values ($1, $2, $3, $4, $5, $6, now())
+            on conflict ("userId", album_group_id, arrangement_type)
+            do update set is_public = excluded.is_public, updated_at = now()
+            """, connection);
+        command.Parameters.AddWithValue(UserScopedId(userId, 125000 + albumGroupId * 10 + arrangementType));
+        command.Parameters.AddWithValue(userId);
+        command.Parameters.AddWithValue(albumGroupId);
+        command.Parameters.AddWithValue(arrangementType);
+        command.Parameters.AddWithValue(isPublic);
+        command.Parameters.AddWithValue(MsgPack.Encode(Array.Empty<object?>()));
+        await command.ExecuteNonQueryAsync();
+        return new object?[] { true };
+    }
+
+    /// <summary>相册预设：保存布局（preset 用 arrangement_type = 9 存放）。</summary>
+    internal async Task<object?[]> SavePhotoPresetAsync(long userId, long presetId, object? payload, string? name)
+    {
+        var values = payload as object?[] ?? Array.Empty<object?>();
+        var layout = DecodePhotoAlbumLayout(values.ElementAtOrDefault(0) ?? values);
+        var encodedLayout = MsgPack.Encode(layout);
+        var extra = MsgPack.Encode(new object?[] { name ?? "" });
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            insert into user_photo_album_arrangements(id, "userId", album_group_id, arrangement_type, is_public, layout_payload, extra_payload, updated_at)
+            values ($1, $2, $3, 9, false, $4, $5, now())
+            on conflict ("userId", album_group_id, arrangement_type)
+            do update set layout_payload = excluded.layout_payload,
+                          extra_payload = excluded.extra_payload,
+                          updated_at = now()
+            """, connection);
+        command.Parameters.AddWithValue(UserScopedId(userId, 126000 + presetId));
+        command.Parameters.AddWithValue(userId);
+        command.Parameters.AddWithValue(presetId);
+        command.Parameters.AddWithValue(encodedLayout);
+        command.Parameters.AddWithValue(extra);
+        await command.ExecuteNonQueryAsync();
+        return new object?[] { true };
+    }
+
+    /// <summary>端点用：相册重置（payload = [albumGroupId, arrangementType]）。</summary>
+    public async Task<object?[]> ResetPhotoAlbumAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context) ?? 0L;
+        if (userId == 0) return new object?[] { false };
+        var values = payload as object?[] ?? Array.Empty<object?>();
+        var albumGroupId = GetLong(values, 0) ?? 1;
+        var arrangementType = (int)(GetLong(values, 1) ?? 1);
+        return await ResetPhotoAlbumAsync(userId, albumGroupId, arrangementType);
+    }
+
+    /// <summary>端点用：相册公开设置（payload = [albumGroupId, arrangementType, isPublic]）。</summary>
+    public async Task<object?[]> SetPhotoAlbumPublishingAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context) ?? 0L;
+        if (userId == 0) return new object?[] { false };
+        var values = payload as object?[] ?? Array.Empty<object?>();
+        var albumGroupId = GetLong(values, 0) ?? 1;
+        var arrangementType = (int)(GetLong(values, 1) ?? 1);
+        var isPublic = GetBool(values, 2) ?? true;
+        return await SetPhotoAlbumPublishingAsync(userId, albumGroupId, arrangementType, isPublic);
+    }
+
+    /// <summary>端点用：相册预设保存（body = 布局 / 名称）。</summary>
+    public async Task<object?[]> SavePhotoPresetAsync(HttpContext context, long presetId, object? payload, bool setname)
+    {
+        var userId = await GetCurrentUserIdAsync(context) ?? 0L;
+        if (userId == 0) return new object?[] { false };
+        string? name = null;
+        if (setname)
+        {
+            var values = payload as object?[];
+            name = values?.ElementAtOrDefault(0) as string ?? "";
+        }
+        return await SavePhotoPresetAsync(userId, presetId, payload, name);
+    }
+
+    /// <summary>剧场故事观看记录（持久化，重复观看不影响）。</summary>
+    public async Task<object?[]> WatchTheaterStoryAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context) ?? 0L;
+        if (userId == 0) return new object?[] { false };
+        var values = payload as object?[] ?? Array.Empty<object?>();
+        var storyId = GetLong(values, 0) ?? 0L;
+        if (storyId <= 0) return new object?[] { false };
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            create table if not exists user_photo_theater_watches (
+              "userId" bigint not null,
+              theater_story_id bigint not null,
+              watched_at timestamptz not null default now(),
+              primary key ("userId", theater_story_id)
+            )
+            """, connection);
+        await command.ExecuteNonQueryAsync();
+        await using var insert = new NpgsqlCommand(
+            """
+            insert into user_photo_theater_watches("userId", theater_story_id)
+            values ($1, $2) on conflict do nothing
+            """, connection);
+        insert.Parameters.AddWithValue(userId);
+        insert.Parameters.AddWithValue(storyId);
+        await insert.ExecuteNonQueryAsync();
+        return new object?[] { true };
     }
 }

@@ -109,7 +109,7 @@ sealed partial class UserDataService
                 // rank 按 CharacterStarRankMaster 重新计算。level 列是 KeyMissionLevel，不能动。
                 await using (var baseRead = new NpgsqlCommand(
                     """
-                    select b.id, b.rank, b.exp
+                    select b.id, b.rank, b.exp, b.character_base_master_id
                     from user_character_bases b
                     join user_character_cards c on c.character_base_id = b.id and c."userId" = b."userId"
                     where c.id = $1 and b."userId" = $2
@@ -123,6 +123,7 @@ sealed partial class UserDataService
                         var baseRowId = reader.GetInt64(0);
                         var baseRank = reader.GetInt32(1);
                         var basePoint = reader.GetInt32(2);
+                        var baseMasterId = reader.GetInt64(3);
                         await reader.CloseAsync();
                         var nextPoint = checked(basePoint + expGain);
                         var nextRank = Math.Max(baseRank, CharacterMissionRules.Rank(nextPoint));
@@ -130,6 +131,9 @@ sealed partial class UserDataService
                             await ExecuteAsync(connection, transaction,
                                 "update user_character_bases set exp=$3, rank=$4 where \"userId\"=$1 and id=$2",
                                 userId, baseRowId, nextPoint, nextRank);
+                        // 星等级提升 → 补发该档位的星等级奖励
+                        if (nextRank > baseRank)
+                            await GrantStarRankRewardsAsync(connection, transaction, userId, baseMasterId, nextRank);
                     }
                 }
             }
@@ -141,6 +145,7 @@ sealed partial class UserDataService
         // 活动点数：和普通演出同一套规则（只有 GM 在 active_events.json 里开启的活动才累加）。
         // 结算界面「活动PT」面板由 FinishLiveResult.EventResult(result[22]) 驱动，null 时客户端不显示。
         var eventPointRows = new List<object?[]>();
+        var eventRewardPresent = new List<object?[]>();
         object?[]? eventResultRow = null;
         try
         {
@@ -165,6 +170,22 @@ sealed partial class UserDataService
                         upsert.Parameters.AddWithValue(eventId);
                         upsert.Parameters.AddWithValue(eventGain);
                         var total = Convert.ToInt64(await upsert.ExecuteScalarAsync());
+                        // 奖励发放失败不能拖垮稽古结算：用 savepoint 单独回滚
+                        await transaction.SaveAsync("event_reward_grant");
+                        EventTotalPointGrant? eventGrant = null;
+                        try
+                        {
+                            eventGrant = await GrantEventTotalPointRewardsAsync(
+                                connection, transaction, userId, eventId, total);
+                        }
+                        catch
+                        {
+                            await transaction.RollbackAsync("event_reward_grant");
+                        }
+                        var receivedOrder = eventGrant?.ReceivedOrder
+                            ?? await ReadReceivedTotalPointOrderAsync(connection, transaction, userId, eventId);
+                        if (eventGrant is not null)
+                            eventRewardPresent.AddRange(eventGrant.Present.Cast<object?[]>());
                         eventPointRows.Add(new object?[]
                         {
                             101,
@@ -177,7 +198,7 @@ sealed partial class UserDataService
                         eventPointRows.Add(new object?[]
                         {
                             140,
-                            new object?[] { UserScopedId(userId, 140000 + eventId), eventId, total, 0 }
+                            new object?[] { UserScopedId(userId, 140000 + eventId), eventId, total, receivedOrder }
                         });
                         if (EventPtCoins.Map.TryGetValue(eventId, out var ptCoinId))
                             await UpsertItemQuantityAsync(connection, transaction, userId, ptCoinId, (int)eventGain);
@@ -198,6 +219,7 @@ sealed partial class UserDataService
         foreach (var item in await ReadItemPossessionsAsync(connection, userId))
             if (touchedItems.Contains(Convert.ToInt64(item[1]))) present.Add(DataObject(27, item));
         foreach (var row in eventPointRows) present.Add(row);
+        foreach (var row in eventRewardPresent) present.Add(row);
         foreach (var character in leveledCharacters) present.Add(DataObject(4, character));
         var result = await BuildLessonFinishResultAsync(connection, userId, session.BaseId, score, judges,
             previousScore, bestScore, milestones.SelectMany(rule => rule.Rewards).ToArray(), eventResultRow,
