@@ -126,7 +126,7 @@ This project is a derivative of [yumesute-server](https://github.com/Sakurashiyo
 - Commercial use is prohibited;
 - When distributing, keep `LICENSE` and the copyright notices, and state your changes.
 
-This repository contains no game assets or master data. The game and related assets are copyright Project WDS and KMS.inc. See [LICENSE](LICENSE) and [NOTICE](NOTICE.md) for details.
+This repository contains no game assets or master data. The game and related assets are copyright ©Sirius/Project WDS and KMS.inc. See [LICENSE](LICENSE) and [NOTICE](NOTICE.md) for details.
 
 ## Acknowledgements
 
