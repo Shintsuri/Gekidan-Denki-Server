@@ -1,6 +1,6 @@
 # Yumeno-Kanae
 
-> 项目名：**Yume-no-Kanae**（夢の叶え）
+> 项目名：**Gekidan-Denki-Server**（劇団電姫）
 
 World Dai Star（ユメステ）服务端实现，C# / .NET 10。
 
