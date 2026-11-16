@@ -1,4 +1,4 @@
-# Yumeno-Kanae
+# Gekidan-Denki-Server
 
 > 项目名：**Gekidan-Denki-Server**（劇団電姫）
 
@@ -37,7 +37,7 @@ C# / .NET 10、ASP.NET Core、gRPC、PostgreSQL、MessagePack、MasterMemory。
 
 基于 yumesute-server-main 二次开发。原项目与本项目均采用 PolyForm Noncommercial License 1.0.0：允许个人使用、修改、非商业分发；禁止商业用途；分发时需保留 LICENSE 与版权声明，并说明修改内容。
 
-早期独立实现的单文件版本已停止维护，见 [Yumeno-Kanae-Prototype](https://github.com/Shintsuri/Yumeno-Kanae-Prototype)。
+早期独立实现的单文件版本已停止维护，见 [Gekidan-Denki-Prototype](https://github.com/Shintsuri/Gekidan-Denki-Prototype)。
 
 ##免责声明
 
