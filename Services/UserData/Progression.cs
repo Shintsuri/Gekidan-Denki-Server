@@ -1,0 +1,551 @@
+using System.Security.Cryptography;
+using Npgsql;
+
+sealed partial class UserDataService
+{
+    public sealed record LiveSettlement(object?[] Result, object?[] Present);
+
+    public async Task<object?[]?> RegisterLiveStartAsync(HttpContext context, object? payload, bool validateMusicUnlock = true,
+        bool buildUnit = false, bool ordinaryRewards = true, LiveRewardRules.Mode mode = LiveRewardRules.Mode.Ordinary,
+        object?[]? modeContext = null)
+    {
+        if (payload is not object?[] start || start.Length < 8 ||
+            !long.TryParse(start[1]?.ToString(), out var chartId) || !PlayerProgressionRules.Charts.ContainsKey(chartId) ||
+            start[7] is not bool auto || start[4] is not bool useStamina
+            || !int.TryParse(start[5]?.ToString(), out var requestedMagnification) || requestedMagnification is < 0 or > 10)
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidStart);
+        var userId = await GetCurrentUserIdAsync(context) ?? throw new BadHttpRequestException("ACCOUNT_UNAUTHORIZED", 401);
+        AuditionRules.Master? audition = null;
+        if (start[2] is not null && mode == LiveRewardRules.Mode.Ordinary && ordinaryRewards)
+        {
+            audition = ValidateAuditionStart(start, chartId);
+            mode = LiveRewardRules.Mode.Audition;
+            buildUnit = true;
+            validateMusicUnlock = false;
+        }
+        else if (start[2] is not null)
+            throw new BadHttpRequestException(AuditionErrors.InvalidStart);
+        await EnsureDefaultUserDataAsync(userId);
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await LockLessonUserAsync(connection, transaction, userId);
+        if (mode == LiveRewardRules.Mode.Ghost)
+            modeContext = await ReadGhostStartAsync(connection, transaction, userId, start, chartId);
+        var startHash = SHA256.HashData(MsgPack.Encode(new object?[] { payload, ordinaryRewards, buildUnit, (int)mode, modeContext }));
+        var pending = await ReadPendingLiveStartAsync(connection, transaction, userId, startHash);
+        if (pending is not null) return pending.Unit;
+        var missionParty = await ReadMissionPartyAsync(connection,userId,GetLong(start,0) ?? 0);
+        if (missionParty.Length == 0 && GetLong(start,0) is > 0)
+            context.RequestServices.GetRequiredService<ILogger<UserDataService>>().LogWarning(
+                "演出缺少可持久化角色编队 userId={UserId} partyId={PartyId} operation={Operation}",userId,GetLong(start,0),"character-mission-snapshot");
+        if (validateMusicUnlock) await ValidateMusicDifficultyAsync(connection, userId, PlayerProgressionRules.Charts[chartId], auto);
+        object?[]? unit = null;
+        if (buildUnit)
+        {
+            var built = await ReadLiveUnitAsync(connection, transaction, userId, GetLong(start, 0) ?? 0, chartId, auto, audition?.SenseNotationId);
+            unit = built.Unit;
+            if (audition is not null) modeContext = new object?[] { 1, audition.Id, built.AuditionParty };
+        }
+        if (!ordinaryRewards && unit is not null) unit[10] = auto ? 0d : 1d;
+        var rank = await ReadRankStateAsync(connection, transaction, userId);
+        var settingId = mode == LiveRewardRules.Mode.Multi ? GetLong(start, 6) ?? 0 : 1;
+        var snapshot = LiveRewardRules.Start(chartId, useStamina, requestedMagnification, rank.Stamina, unit, ordinaryRewards, settingId);
+        if (snapshot.StaminaCost > 0)
+            await ExecuteAsync(connection, transaction,
+                """
+                update user_game_states
+                set stamina=stamina-$2,
+                  stamina_recovery_checkpoint_at=case when stamina >= max_stamina then now() else stamina_recovery_checkpoint_at end,
+                  updated_at=now()
+                where "userId"=$1
+                """,
+                userId, snapshot.StaminaCost);
+        // 每日任务：消耗体力 300（100000）；顺手重算「完成所有每日任务」
+        if (snapshot.StaminaCost > 0 && ordinaryRewards)
+            await AdvanceDailyMissionAsync(connection, transaction, userId, 100000, snapshot.StaminaCost);
+        await using var command = new NpgsqlCommand(
+            """
+            insert into user_live_sessions ("userId", live_master_id, is_auto, use_stamina, character_mission_party,start_snapshot,start_hash,live_mode,mode_context)
+            values ($1, $2, $3, $4, $5,$6,$7,$8,$9)
+            on conflict ("userId") do update set live_master_id = excluded.live_master_id,
+              is_auto = excluded.is_auto, use_stamina = excluded.use_stamina,
+              completion = null, finish_hash = null, started_at = now(),character_mission_party=excluded.character_mission_party,
+              start_snapshot=excluded.start_snapshot,start_hash=excluded.start_hash,live_mode=excluded.live_mode,mode_context=excluded.mode_context
+            """, connection, transaction);
+        command.Parameters.AddWithValue(userId);
+        command.Parameters.AddWithValue(chartId);
+        command.Parameters.AddWithValue(auto);
+        command.Parameters.AddWithValue(useStamina);
+        command.Parameters.AddWithValue(MsgPack.Encode(missionParty));
+        command.Parameters.AddWithValue(MsgPack.Encode(snapshot.ToWire()));
+        command.Parameters.AddWithValue(startHash);
+        command.Parameters.AddWithValue((int)mode);
+        command.Parameters.Add(new NpgsqlParameter { NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Bytea,
+            Value = modeContext is null ? DBNull.Value : MsgPack.Encode(modeContext) });
+        await command.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+        context.RequestServices.GetRequiredService<ILogger<UserDataService>>().LogInformation(
+            "演出开演 operation=live-start userId={UserId} chartId={ChartId} mode={Mode} auditionId={AuditionId} ordinary={Ordinary} requestedMagnification={RequestedMagnification} effectiveMagnification={EffectiveMagnification} staminaCost={StaminaCost} staminaBefore={StaminaBefore} staminaAfter={StaminaAfter} outcome=success",
+            userId, chartId, mode, audition?.Id, ordinaryRewards, requestedMagnification, snapshot.EffectiveMagnification, snapshot.StaminaCost,
+            snapshot.StaminaBefore, snapshot.StaminaBefore - snapshot.StaminaCost);
+        if (unit is not null) context.RequestServices.GetRequiredService<ILogger<UserDataService>>().LogInformation(
+            "生成演出编队 operation=live-unit userId={UserId} partyId={PartyId} chartId={ChartId} totalStatus={TotalStatus} firstPlayOlivier={FirstPlayOlivier} outcome=success",
+            userId, GetLong(start, 0), chartId, unit[5], unit[8]);
+        return unit;
+    }
+
+    static async Task NormalizeRankAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long userId)
+    {
+        var state = await ReadRankStateAsync(connection, transaction, userId);
+        var next = PlayerProgressionRules.Advance(state.Rank, state.Exp, 0, state.Limit);
+        if (next.Rank == state.Rank && next.Exp == state.Exp && next.MaxStamina == state.MaxStamina) return;
+        await ExecuteAsync(connection, transaction,
+            """
+            update user_game_states set rank = $2, exp = $3, max_stamina = $4,
+              stamina = stamina + $5, updated_at = now() where "userId" = $1
+            """, userId, next.Rank, next.Exp, next.MaxStamina, next.StaminaRecovery);
+    }
+
+    static async Task<(int Rank, int Exp, int Stamina, int Limit, int MaxStamina)> ReadRankStateAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, long userId)
+    {
+        await RefreshStaminaAsync(connection, userId, transaction);
+        await using var command = new NpgsqlCommand(
+            "select rank, exp, stamina, rank_limit, max_stamina from user_game_states where \"userId\" = $1 for update", connection, transaction);
+        command.Parameters.AddWithValue(userId);
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) throw new InvalidOperationException("缺少玩家等级状态");
+        return (reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3), reader.GetInt32(4));
+    }
+
+    static async Task<double> ReadPlayerRatingAsync(NpgsqlConnection connection, long userId)
+    {
+        await using var command = new NpgsqlCommand(
+            """
+            select coalesce(round(sum(notation_rate)::numeric, 2), 0)::double precision from (
+              select notation_rate from user_live_play_results
+              where "userId" = $1 and difficulty between 1 and 4 and notation_rate > 0
+              order by notation_rate desc, live_master_id limit 30
+            ) best
+            """, connection);
+        command.Parameters.AddWithValue(userId);
+        return Convert.ToDouble(await command.ExecuteScalarAsync());
+    }
+
+    public async Task<LiveSettlement> BuildLiveSettlementAsync(HttpContext context, object? payload)
+    {
+        var submitted = payload as object?[];
+        if (payload is object?[] rawFinish) payload = LiveFinishValidation.Normalize(rawFinish);
+        if (payload is not object?[] finish || finish.Length < 4 ||
+            !long.TryParse(finish[0]?.ToString(), out var score) || score < 0 || finish[3] is not bool cleared)
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidFinish);
+        var userId = await GetCurrentUserIdAsync(context) ?? throw new BadHttpRequestException("ACCOUNT_UNAUTHORIZED", 401);
+        await EnsureDefaultUserDataAsync(userId);
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        var operations = await GameOperationsService.ReadAsync(connection, transaction, lockForUse: true);
+        await LockLessonUserAsync(connection, transaction, userId);
+        // 两种演出共用结束接口，按最近一次开始的会话分流，不能命中历史普通演出。
+        await using (var lessonMode = new NpgsqlCommand(
+            """
+            select exists(select 1 from user_lesson_sessions l where l."userId"=$1
+              and not exists(select 1 from user_live_sessions v where v."userId"=l."userId" and v.started_at>=l.started_at))
+            """, connection, transaction))
+        {
+            lessonMode.Parameters.AddWithValue(userId);
+            if ((bool)(await lessonMode.ExecuteScalarAsync())!)
+            {
+                var lesson = await FinishLessonCoreAsync(connection, transaction, userId, new object?[] { finish[0], finish[1], finish[2] });
+                await transaction.CommitAsync();
+                context.RequestServices.GetRequiredService<ILogger<UserDataService>>().LogInformation(
+                    "稽古结算成功 userId={UserId} operation={Operation} score={Score}", userId, "lesson-finish-live", score);
+                return lesson;
+            }
+        }
+        long chartId;
+        bool auto, useStamina;
+        LiveRewardRules.Mode mode;
+        object?[]? modeContext;
+        LiveRewardRules.Snapshot snapshot;
+        object?[] missionParty;
+        var hash = SHA256.HashData(MsgPack.Encode(payload));
+        await using (var command = new NpgsqlCommand(
+            "select live_master_id, is_auto, use_stamina, completion, finish_hash,character_mission_party,start_snapshot,live_mode,mode_context from user_live_sessions where \"userId\" = $1 for update", connection, transaction))
+        {
+            command.Parameters.AddWithValue(userId);
+            await using var reader = await command.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) throw new BadHttpRequestException(LiveProgressionErrors.SessionMissing, 409);
+            if (!reader.IsDBNull(3))
+            {
+                if (!hash.AsSpan().SequenceEqual(reader.GetFieldValue<byte[]>(4)))
+                    throw new BadHttpRequestException(LiveProgressionErrors.SessionConflict, 409);
+                var cached = (object?[])MsgPack.Decode(reader.GetFieldValue<byte[]>(3))!;
+                // 结算奖励沿用幂等缓存，谱面状态取当前存档，避免迟到重试覆盖后来购买的解锁。
+                await reader.DisposeAsync();
+                var replay = ((object?[])cached[1]!).Cast<object?[]>()
+                    .Where(row=>Convert.ToInt32(row[0]) is not (25 or 130)).Cast<object?>().ToList();
+                replay.AddRange((await ReadLiveMusicStatesAsync(connection,userId)).Select(row=>DataObject(25,row)));
+                replay.Add(DataObject(130,await ReadLiveAchievementAsync(connection,userId)));
+                return new((object?[])cached[0]!, replay.ToArray());
+            }
+            chartId = reader.GetInt64(0); auto = reader.GetBoolean(1); useStamina = reader.GetBoolean(2);
+            mode = (LiveRewardRules.Mode)reader.GetInt32(7);
+            modeContext = reader.IsDBNull(8) ? null : (object?[])MsgPack.Decode(reader.GetFieldValue<byte[]>(8))!;
+            // 旧会话没有队伍快照，不能凭当前编队补写无法核实的历史角色进度。
+            missionParty = reader.IsDBNull(5) ? Array.Empty<object?>() : (object?[])MsgPack.Decode(reader.GetFieldValue<byte[]>(5))!;
+            // 更新前未完成的会话缺少实际扣除依据，要求重新开演；已完成会话仍可命中上面的幂等缓存。
+            if (reader.IsDBNull(6)) throw new BadHttpRequestException(LiveProgressionErrors.SessionMissing, 409);
+            snapshot = LiveRewardRules.Snapshot.FromWire((object?[])MsgPack.Decode(reader.GetFieldValue<byte[]>(6))!);
+        }
+        // 客户端 2.31.3 只上传 5 段（逐音符 + 3 个标量）。私有服务器不再强制 10 段汇总格式。
+        if (submitted is null)
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidFinish);
+        var chart = PlayerProgressionRules.Charts[chartId];
+        // 复算资格由服务端会话快照决定，客户端提交的形态不能关闭复算。
+        // 私有服务器：采信客户端上报的分数，只做「不超过理论满分」的合理性校验。
+        var mustRecalculate = false;
+        var baseScoreRecalculated = false;
+        var skillScoreRecalculated = false;
+        var recalculated = submitted;
+        // 客户端上报的总分只用于比对，入库分数一律取服务端复算结果。
+        var reportedScore = score;
+        if (mustRecalculate && submitted is { Length: 10 }
+            && LiveBaseScoreRules.CanRecalculate(snapshot.Unit!, submitted))
+        {
+            recalculated = LiveBaseScoreRules.Recalculate(snapshot.Unit!, submitted);
+            baseScoreRecalculated = true;
+            if (LiveSkillScoreRules.CanRecalculate(snapshot.Unit!, recalculated!))
+            {
+                recalculated = LiveSkillScoreRules.Recalculate(snapshot.Unit!, recalculated!);
+                skillScoreRecalculated = true;
+            }
+            finish = LiveFinishValidation.Normalize(recalculated!);
+            score = Convert.ToInt64(finish[0]);
+            // 私有服务器的复算公式无法与客户端完全一致，改为以服务端复算结果入库，不再拒绝。
+            if (score != reportedScore)
+                Console.WriteLine($"[live] score mismatch recalculated={score} reported={reportedScore}");
+            ValidateNoteCount(snapshot.Unit!, finish);
+        }
+        else
+        {
+            // 自动演出、含动态效果或旧会话无法复算，此时至少校验分数不超过该编队理论最高分。
+            ValidateScoreWithinBounds(score, snapshot, chartId);
+        }
+        if (!auto) cleared = FinishLifeIsPositive(finish) && cleared;
+        if (!auto) await RecordCharacterMissionLiveAsync(connection,transaction,userId,missionParty,finish,cleared);
+        var state = await ReadRankStateAsync(connection, transaction, userId);
+        // 完成演出即结算消耗与奖励；通关灯、rating 和通关进度仍按通关状态判断。
+        var gain = snapshot.Ordinary ? snapshot.Experience : useStamina ? CapturedLiveExpGain : 0;
+        var coins = snapshot.Ordinary ? LiveRewardRules.Coins(snapshot, score) : CapturedLiveCoinGain;
+        var next = PlayerProgressionRules.Advance(state.Rank, state.Exp, gain, state.Limit);
+        var beforeRating = await ReadPlayerRatingAsync(connection, userId);
+        decimal achievement = 0, notation = 0;
+        var lamp = 0;
+        double bestAchievement = 0, bestNotation = 0;
+        var beforeLamp = 0;
+        if (!auto)
+        {
+            var judges = ReadFinishJudges(finish);
+            achievement = PlayerProgressionRules.Achievement(judges);
+            lamp = cleared ? judges.Where(pair => pair.Key < 5).Sum(pair => pair.Value) == 0 ? 6 :
+                judges.Where(pair => pair.Key <= 2).Sum(pair => pair.Value) == 0 ? 2 : 1 : 0;
+            notation = cleared && chart.Difficulty <= 4 ? PlayerProgressionRules.NotationRate(chart.Level, achievement) : 0;
+            await using (var previous = new NpgsqlCommand(
+                "select achievement_rate, notation_rate, clear_lamp from user_live_play_results where \"userId\" = $1 and live_master_id = $2 and difficulty = $3", connection, transaction))
+            {
+                previous.Parameters.AddWithValue(userId); previous.Parameters.AddWithValue(chartId); previous.Parameters.AddWithValue(chart.Difficulty);
+                await using var reader = await previous.ExecuteReaderAsync();
+                if (await reader.ReadAsync()) { bestAchievement = reader.GetDouble(0); bestNotation = reader.GetDouble(1); beforeLamp = reader.GetInt32(2); }
+            }
+            await SaveChartResultAsync(connection, transaction, userId, chart, score, achievement, notation, lamp, cleared);
+        }
+        await ExecuteAsync(connection, transaction,
+            """
+            update user_game_states set rank = $2, exp = $3, max_stamina = $4,
+              stamina = greatest(stamina - $5, 0) + $6,
+              stamina_recovery_checkpoint_at = case when $5 > 0 and stamina >= max_stamina
+                then now() else stamina_recovery_checkpoint_at end,
+              coin = coin + $7, updated_at = now()
+            where "userId" = $1
+            """, userId, next.Rank, next.Exp, next.MaxStamina, !snapshot.Ordinary && useStamina ? 1 : 0, next.StaminaRecovery, coins);
+        await ExecuteAsync(connection, transaction, "update user_item_currencies set coin = coin + $2 where \"userId\" = $1", userId, coins);
+        var ordinaryDrops = snapshot.Ordinary
+            ? LiveRewardRules.Materials(snapshot, score, DateTime.UtcNow, Random.Shared.Next)
+            : Array.Empty<LiveRewardRules.Drop>();
+        var rewards = snapshot.Ordinary
+            ? ordinaryDrops.Select(drop => (ItemMasterId: drop.MasterId, Quantity: drop.Quantity)).ToArray()
+            : CapturedLiveItemRewards.Where(reward => reward.ItemMasterId != MissionPassRules.PointItemId
+                || operations.Configuration.MissionPass.IsOpen(DateTimeOffset.UtcNow)).ToArray();
+        // Mission Pass 沿用既有积分策略，其产出倍率不属于本次已核实的普通掉落公式。
+        if (snapshot.Ordinary && operations.Configuration.MissionPass.IsOpen(DateTimeOffset.UtcNow))
+            rewards = rewards.Concat(CapturedLiveItemRewards.Where(reward => reward.ItemMasterId == MissionPassRules.PointItemId)).ToArray();
+        foreach (var reward in rewards) await UpsertItemQuantityAsync(connection, transaction, userId, reward.ItemMasterId, reward.Quantity);
+        await RecordDifficultyUnlockAsync(connection,transaction,userId,chart,finish,auto,cleared,achievement);
+        await SynchronizeMusicUnlocksAsync(connection,transaction,userId);
+        var rating = await ReadPlayerRatingAsync(connection, userId);
+        await ExecuteAsync(connection, transaction, "update user_live_user_stats set score_rating = $2 where \"userId\" = $1", userId, rating);
+        // 不再向普通演出注入抓包里的活动、试镜和任务进度。
+        // 活动点数：若 GM 开启了活动，打歌按分数累加活动点数
+        var eventPointRows = new List<object?[]>();
+        // 结算界面「活动PT」面板由 FinishLiveResult.EventResult 驱动：
+        //   [0] 本局获得的活动点数  [1] 活动 ID  [2] 社团最高分  [3] 倍率
+        // 该字段为 null 时客户端不会显示活动点数面板。
+        object?[]? eventResultRow = null;
+        try
+        {
+            var activePath = System.IO.Path.Combine(AppContext.BaseDirectory, "active_events.json");
+            if (System.IO.File.Exists(activePath))
+            {
+                using var activeDoc = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText(activePath));
+                foreach (var item in activeDoc.RootElement.EnumerateArray())
+                {
+                    if (!item.TryGetInt64(out var eventId)) continue;
+                    // 官方公式：PT = 100 × (体力/20) × スコア係数 × (1 + 编成加成) × ブースト倍率。
+                    // 已用实测校准（10,623,783 分 / 体力 34 / +175% / 10 炊き → 22,819）。
+                    var eventBonus = ReadEventFormationBonus(snapshot.Unit, eventId);
+                    var eventGain = EventPointRules.Calculate(
+                        score, snapshot.BaseStamina, snapshot.EffectiveMagnification, eventBonus);
+                    await using (var upsert = new NpgsqlCommand("""
+                        insert into user_story_event_states(id, "userId", event_master_id, point)
+                        values ($1, $2, $3, $4)
+                        on conflict ("userId", event_master_id) do update
+                          set point = user_story_event_states.point + $4, updated_at = now()
+                        returning point
+                        """, connection, transaction))
+                    {
+                        upsert.Parameters.AddWithValue(UserScopedId(userId, 9000000 + eventId));
+                        upsert.Parameters.AddWithValue(userId);
+                        upsert.Parameters.AddWithValue(eventId);
+                        upsert.Parameters.AddWithValue(eventGain);
+                        var total = Convert.ToInt64(await upsert.ExecuteScalarAsync());
+                        eventPointRows.Add(new object?[]
+                        {
+                            101,
+                            new object?[]
+                            {
+                                UserScopedId(userId, 101000 + eventId), eventId, total,
+                                DateTime.UtcNow, 0, false, 1
+                            }
+                        });
+                        eventPointRows.Add(new object?[]
+                        {
+                            140,
+                            new object?[] { UserScopedId(userId, 140000 + eventId), eventId, total, 0 }
+                        });
+                        // 交换所消耗的是该期的 PT 硬币道具，点数必须同时记到道具上
+                        if (EventPtCoins.Map.TryGetValue(eventId, out var ptCoinId))
+                            await UpsertItemQuantityAsync(connection, transaction, userId, ptCoinId, (int)eventGain);
+                        // 只取第一个活动作为结算面板展示的数据。
+                        // 字段顺序必须对齐客户端 EventResult 的 14 个属性：
+                        // 0 AcquiredEventPoint / 1 AttachedStoryEventMasterId / 2 CircleEventHighScore
+                        // 3 CircleEventHighScoreMultiplierPercent / 4 CircleEventBeforeHighScore
+                        // 5 HighScoreBefore / 6 HighScoreAfter / 7 BeforeRank / 8 AfterRank
+                        // 9 StoryEventMasterId / 10 EventMasterId / 11 ThisTimeSupportPoint
+                        // 12 CampBeforeRank / 13 CampAfterRank
+                        eventResultRow ??= new object?[]
+                        {
+                            (int)eventGain, 0L, null, null, null, null, null, 0L, 0L, eventId, eventId, null, null, null
+                        };
+                    }
+                }
+            }
+        }
+        catch (Exception eventError)
+        {
+            context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                .LogWarning("活动点数累加失败 error={Error}", eventError.Message);
+        }
+
+        var result = new object?[31];
+        result[1] = Array.Empty<object?>(); result[9] = 0; result[10] = 0;
+        result[11] = Array.Empty<object?>(); result[12] = Array.Empty<object?>();
+        result[21] = 0; result[30] = Array.Empty<object?>();
+        // 初回クリア：追加固定掉落（饰品），并标记 is_fixed_drop=true，客户端才会点亮初回奖章
+        var firstClearDrops = Array.Empty<LiveRewardRules.Drop>();
+        if (snapshot.Ordinary && beforeLamp == 0 && !auto)
+        {
+            firstClearDrops = LiveRewardRules.FirstClearDrops(snapshot, DateTime.UtcNow, Random.Shared.Next);
+            foreach (var drop in firstClearDrops)
+            {
+                if (drop.Type != 4) continue;   // 饰品：写入 user_accessories
+                try
+                {
+                    await using var acc = new NpgsqlCommand("""
+                        insert into user_accessories("userId", accessory_master_id)
+                        select $1, $2
+                        where not exists (
+                          select 1 from user_accessories where "userId"=$1 and accessory_master_id=$2)
+                        """, connection, transaction);
+                    acc.Parameters.AddWithValue(userId);
+                    acc.Parameters.AddWithValue(drop.MasterId);
+                    await acc.ExecuteNonQueryAsync();
+                }
+                catch (Exception error)
+                {
+                    context.RequestServices.GetRequiredService<ILogger<UserDataService>>()
+                        .LogWarning("初回饰品掉落写入失败 master={Master} error={Error}", drop.MasterId, error.Message);
+                }
+            }
+        }
+        var drops = snapshot.Ordinary ? ordinaryDrops.Select(drop => (object?)drop.ToWire()).ToList()
+            : rewards.Select((reward, index) => (object?)new object?[]
+        {
+            new object?[] { 1, reward.ItemMasterId, reward.Quantity, null, null, null, false }, index + 101, 0, false
+        }).ToList();
+        foreach (var drop in firstClearDrops)
+            drops.Add(new object?[]
+            {
+                new object?[] { drop.Type, drop.MasterId, drop.Quantity, null, null, null, false },
+                drop.FrameId, 0, true
+            });
+        if (coins > 0) drops.Add(new object?[] { new object?[] { 12, 0, coins, null, null, null, false }, 0, 0, false });
+        result[23] = drops.ToArray();
+        result[2] = new object?[] { new object?[] { bestAchievement, (double)achievement }, new object?[] { bestNotation, (double)notation }, beforeRating, rating };
+        result[3] = new object?[] { state.Rank, next.Rank, state.Exp, next.Exp, gain, snapshot.Ordinary ? snapshot.StaminaBefore : state.Stamina };
+        result[5] = lamp; result[6] = auto ? 0 : PlayerProgressionRules.Grade(achievement);
+        result[8] = false; result[13] = (double)achievement; result[20] = beforeLamp;
+        // 活动点数结算面板
+        if (eventResultRow is not null) result[22] = eventResultRow;
+        // 打歌 → 剧团贡献度（社团排行 日间/周间/月间 的数据来源）。
+        // 之前只有读没有写，所以社团排行永远是 0。这里按分数折算，日间上限 10000。
+        try
+        {
+            await using (var circle = new NpgsqlCommand(
+                "select circle_id from user_circle_memberships where \"userId\"=$1 limit 1", connection, transaction))
+            {
+                circle.Parameters.AddWithValue(userId);
+                if (await circle.ExecuteScalarAsync() is string circleId && !string.IsNullOrEmpty(circleId))
+                {
+                    var contribution = Math.Clamp((int)(score / 100), 1, 10000);
+                    await ExecuteAsync(connection, transaction, """
+                        insert into user_circle_support_points("userId", circle_id, support_day, point)
+                        values($1, $2, $3, $4)
+                        on conflict ("userId", circle_id, support_day) do update
+                          set point = least(10000, user_circle_support_points.point + excluded.point)
+                        """, userId, circleId, CircleSupportDay(DateTimeOffset.UtcNow), contribution);
+                }
+            }
+        }
+        catch
+        {
+            // 社团贡献度失败不影响演出结算
+        }
+        if (mode == LiveRewardRules.Mode.Ghost)
+            result[28] = await FinishGhostAsync(connection, transaction, userId, modeContext
+                ?? throw new InvalidDataException("Ghost 演出缺少对手快照"), score);
+        var present = new List<object?>();
+        if (mode == LiveRewardRules.Mode.Audition)
+            await FinishAuditionAsync(connection, transaction, userId, modeContext
+                ?? throw new InvalidDataException("公演结算缺少模式快照"), snapshot, finish, score, auto, cleared, achievement, result, present);
+        present.AddRange(new object?[] { DataObject(0, await ReadUserAsync(connection, userId)),
+            DataObject(1, await ReadProfileAsync(connection, userId)), DataObject(128, await ReadCurrencyAsync(connection, userId)) });
+        if (!auto)
+        {
+            foreach (var row in await ReadLivePlayResultsAsync(connection, userId))
+                if (Convert.ToInt64(row[1]) == chartId) present.Add(DataObject(24, row));
+        }
+        foreach (var row in await ReadItemPossessionsAsync(connection, userId))
+            if (rewards.Any(reward => reward.ItemMasterId == Convert.ToInt64(row[1]))) present.Add(DataObject(27, row));
+        present.AddRange((await ReadCharacterMissionsAsync(connection,userId)).Select(row => DataObject(96,row)));
+        var musicStates = await ReadLiveMusicStatesAsync(connection,userId);
+        present.AddRange(musicStates.Select(row=>DataObject(25,row)));
+        present.Add(DataObject(130,await ReadLiveAchievementAsync(connection,userId)));
+        // 活动点数变化也作为 present 下发
+        foreach (var row in eventPointRows) present.Add(row);
+
+        var settlement = new LiveSettlement(result,present.ToArray());
+        await ExecuteAsync(connection, transaction,
+            "update user_live_sessions set completion = $2, finish_hash = $3 where \"userId\" = $1",
+            userId, MsgPack.Encode(new object?[] { settlement.Result, settlement.Present }), hash);
+        await transaction.CommitAsync();
+        context.RequestServices.GetRequiredService<ILogger<UserDataService>>().LogInformation(
+            "Live settlement userId={UserId} chartId={ChartId} mode={Mode} auditionId={AuditionId} auditionPhaseBefore={AuditionPhaseBefore} auditionPhaseAfter={AuditionPhaseAfter} auto={Auto} cleared={Cleared} score={Score} achievement={Achievement} rank={Rank} exp={Exp} rating={Rating} stellaReleased={StellaReleased} olivierStatus={OlivierStatus} effectiveMagnification={EffectiveMagnification} coins={Coins} baseScoreRecalculated={BaseScoreRecalculated} skillScoreRecalculated={SkillScoreRecalculated}",
+            userId, chartId, mode, result[14], result[9], result[10], auto, cleared, score, achievement, next.Rank, next.Exp, rating,
+            musicStates.Single(row=>Convert.ToInt64(row[2])==chart.MusicMasterId)[5],
+            musicStates.Single(row=>Convert.ToInt64(row[2])==chart.MusicMasterId)[8],
+            snapshot.EffectiveMagnification, coins, baseScoreRecalculated, skillScoreRecalculated);
+        return settlement;
+    }
+
+    // 只提交少量音符会把「每音符增量 = 权重 / 音符数」放大成满分。
+    // 开演快照里保存了谱面时轴，按其中的音符事件下限校验提交总数。
+    static void ValidateNoteCount(object?[] unit, object?[] finish)
+    {
+        var minimum = LiveBaseScoreRules.MinimumNoteCount(unit);
+        if (minimum <= 0 || finish[4] is not object?[] notes) return;
+        if (notes.Length < minimum)
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidFinish);
+    }
+
+    static void ValidateScoreWithinBounds(long score, LiveRewardRules.Snapshot snapshot, long chartId)
+    {
+        var chart = PlayerProgressionRules.Charts[chartId];
+        var maximum = snapshot.Unit is { Length: 12 }
+            ? LiveBaseScoreRules.MaximumScore(Convert.ToInt32(snapshot.Unit[5]),
+                LiveBaseScoreRules.Coefficient(chart.Difficulty, false), Convert.ToDouble(snapshot.Unit[9]))
+            : 0;
+        // 我们的理论上限公式未含技能/卡片加成，会低于客户端实际得分。
+        // 因此只在明显离谱（超过上限 5 倍）时驳回，其余采信客户端分数。
+        Console.WriteLine($"[live] score={score} theoreticalMax={maximum}");
+        if (maximum > 0 && score > maximum * 5)
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidFinish);
+    }
+
+    static Dictionary<int, int> ReadFinishJudges(object?[] finish)
+    {
+        if (finish[2] is not object?[] rows) throw new BadHttpRequestException(LiveProgressionErrors.InvalidJudges);
+        var judges = new Dictionary<int, int>();
+        foreach (var value in rows)
+        {
+            if (value is not object?[] row || row.Length != 2 || !int.TryParse(row[0]?.ToString(), out var timing) ||
+                !int.TryParse(row[1]?.ToString(), out var count) || !judges.TryAdd(timing, count))
+                throw new BadHttpRequestException(LiveProgressionErrors.InvalidJudges);
+        }
+        return judges;
+    }
+
+    static bool FinishLifeIsPositive(object?[] finish)
+    {
+        if (finish.Length <= 4 || finish[4] is not object?[] blocks || blocks.Length == 0 ||
+            blocks[^1] is not object?[] last || last.Length < 3 || !int.TryParse(last[2]?.ToString(), out var life))
+            throw new BadHttpRequestException(LiveProgressionErrors.InvalidFinish);
+        return life > 0;
+    }
+
+    static Task SaveChartResultAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long userId,
+        PlayerProgressionRules.Chart chart, long score, decimal achievement, decimal notation, int lamp, bool cleared) =>
+        ExecuteAsync(connection, transaction,
+            """
+            insert into user_live_play_results (id, "userId", live_master_id, difficulty, best_score,
+              achievement_rate, notation_rate, clear_lamp, rate_grade, clear_count, full_combo_count, all_perfect_count)
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            on conflict ("userId", live_master_id, difficulty) do update set
+              best_score = greatest(user_live_play_results.best_score, excluded.best_score),
+              achievement_rate = greatest(user_live_play_results.achievement_rate, excluded.achievement_rate),
+              notation_rate = greatest(user_live_play_results.notation_rate, excluded.notation_rate),
+              clear_lamp = greatest(user_live_play_results.clear_lamp, excluded.clear_lamp),
+              rate_grade = greatest(user_live_play_results.rate_grade, excluded.rate_grade),
+              clear_count = user_live_play_results.clear_count + excluded.clear_count,
+              full_combo_count = user_live_play_results.full_combo_count + excluded.full_combo_count,
+              all_perfect_count = user_live_play_results.all_perfect_count + excluded.all_perfect_count,
+              played_at = now(), updated_at = now()
+            """, UserScopedId(userId, chart.Id), userId, chart.Id, chart.Difficulty, (double)score,
+            (double)achievement, (double)notation, lamp, PlayerProgressionRules.Grade(achievement), cleared ? 1 : 0, lamp >= 2 ? 1 : 0, lamp == 6 ? 1 : 0);
+
+    /// <summary>从编成快照里取 5 个角色的 (base id, 卡 master id)，交给 EventBonusRules 算加成。</summary>
+    static decimal ReadEventFormationBonus(object?[]? unit, long eventMasterId)
+    {
+        if (unit is null || unit.Length == 0 || unit[0] is not Dictionary<int, object?> actors) return 0m;
+        var entries = new List<EventBonusRules.ActorEntry>();
+        foreach (var actor in actors.Values)
+        {
+            if (actor is not object?[] row || row.Length < 3) continue;
+            long baseId = 0, cardMasterId = 0;
+            try { if (row[1] is not null) baseId = Convert.ToInt64(row[1]); } catch { }
+            try { if (row[2] is not null) cardMasterId = Convert.ToInt64(row[2]); } catch { }
+            if (baseId == 0) continue;
+            entries.Add(new EventBonusRules.ActorEntry(baseId, cardMasterId));
+        }
+        return EventBonusRules.Calculate(eventMasterId, entries);
+    }
+}

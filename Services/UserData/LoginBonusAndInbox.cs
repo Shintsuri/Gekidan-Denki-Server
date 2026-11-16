@@ -1,0 +1,451 @@
+using System.Text.Json;
+using Npgsql;
+using LoginBonusReward = LoginBonusRules.Reward;
+
+sealed partial class UserDataService
+{
+    // 客户端的 ReceiveLimitAt 是非空 DateTime；这个远期值表示永久有效。
+    static readonly DateTime InboxNoExpiryLimitUtc = new(2099, 12, 31, 23, 59, 59, DateTimeKind.Utc);
+
+    // 单件礼包的上限，超过这个量级的载荷一定是伪造或损坏的。
+    const int MaxInboxQuantity = 1_000_000;
+
+    public async Task<LoginBonusReceiveResult> CheckReceiveLoginBonusAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return new LoginBonusReceiveResult(Array.Empty<object?>(), Array.Empty<object?>());
+
+        await EnsureDefaultUserDataAsync(userId.Value);
+
+        var now = DateTimeOffset.UtcNow;
+        var windowStartUtc = CurrentDailyResetBoundaryUtc(now).UtcDateTime;
+        var windowKey = new DateTimeOffset(windowStartUtc).ToOffset(JapanStandardTimeOffset).ToString("yyyyMMdd");
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        var operations = await GameOperationsService.ReadAsync(connection, transaction, lockForUse: true);
+        await LockLessonUserAsync(connection, transaction, userId.Value);
+        var bonuses = new List<object?>();
+        var bootstrapKeys = new List<string>();
+        foreach (var source in LoginBonusRules.Rewards)
+        {
+            var setting = operations.Configuration.LoginBonuses[source.Id];
+            if (!setting.IsOpen(now)) continue;
+            var reward = source with
+            {
+                StartAt = setting.StartsAt, EndAt = setting.EndsAt ?? MissionPassRules.PermanentEnd,
+                ThingType = setting.ThingType ?? source.ThingType, MasterId = setting.MasterId ?? source.MasterId,
+                Quantity = setting.Quantity ?? source.Quantity, Days = setting.Days ?? source.Days,
+                IsLoop = setting.IsLoop ?? source.IsLoop
+            };
+            var count = 0;
+            await using (var history = new NpgsqlCommand("""
+                select count(*)::integer from user_login_bonus_claims where "userId"=$1 and login_bonus_id=$2
+                """, connection, transaction))
+            {
+                history.Parameters.AddWithValue(userId.Value); history.Parameters.AddWithValue(reward.Id);
+                count = (int)(await history.ExecuteScalarAsync())!;
+            }
+            if (!reward.IsLoop && count >= reward.Days) continue;
+            // 各活动按游戏日独立幂等，当天新开启的活动不会被常规签到挡住。
+            await using var claim = new NpgsqlCommand("""
+                insert into user_login_bonus_claims("userId",login_bonus_id,game_day) values($1,$2,$3)
+                on conflict ("userId",login_bonus_id,game_day) do nothing returning login_bonus_id
+                """, connection, transaction);
+            claim.Parameters.AddWithValue(userId.Value); claim.Parameters.AddWithValue(reward.Id);
+            claim.Parameters.AddWithValue(DateOnly.ParseExact(windowKey, "yyyyMMdd"));
+            if (await claim.ExecuteScalarAsync() is null) continue;
+            var bootstrapKey = $"login-bonus-{windowKey}-{reward.Id}";
+            var payload = JsonSerializer.Serialize(new
+            {
+                bootstrapKey, ThingType = reward.ThingType, MasterId = reward.MasterId,
+                Quantity = reward.Quantity, Message = $"{reward.Title}の報酬です"
+            });
+            await ExecuteAsync(connection, transaction, """
+                insert into user_item_inbox_packages("userId",payload,expires_at) values($1,$2::jsonb,now()+interval '30 days')
+                """, userId.Value, payload);
+            bonuses.Add(BuildLoginBonusResult(reward, reward.IsLoop ? count % reward.Days + 1 : count + 1));
+            bootstrapKeys.Add(bootstrapKey);
+        }
+        if (bonuses.Count > 0)
+        {
+            await ExecuteAsync(connection, transaction, """
+                update user_login_bonus_states set current_count=current_count+1,total_count=total_count+1,
+                    shown_at=$3,status=1,updated_at=now()
+                where "userId"=$1 and (status<>1 or shown_at<$2)
+                """, userId.Value, windowStartUtc, now.UtcDateTime);
+        }
+        // 方案B：没有可领奖励时直接返回空数组，客户端不进入登录奖励场景。
+        // 若确实出现启动死锁，可用 GM 重置领取记录恢复。
+        await transaction.CommitAsync();
+        var packages = await ReadInboxPackagesByBootstrapKeysAsync(connection, userId.Value, bootstrapKeys);
+        var presentData = packages.Select(value => DataObject(41, value)).ToArray();
+        context.RequestServices.GetRequiredService<ILogger<UserDataService>>().Log(bonuses.Count > 0 ? LogLevel.Information : LogLevel.Debug,
+            "登录奖励检查完成 operation={Operation} userId={UserId} gameDay={GameDay} rewardCount={RewardCount}",
+            "login-bonus-claim", userId, windowKey, bonuses.Count);
+        return new LoginBonusReceiveResult(bonuses.ToArray(), presentData);
+    }
+
+    public async Task<bool> HasUnreadInboxPackagesAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return false;
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            select exists (
+              select 1
+              from user_item_inbox_packages
+              where "userId" = $1
+                and received_at is null
+                and (expires_at is null or expires_at > now())
+            )
+            """,
+            connection);
+        command.Parameters.AddWithValue(userId.Value);
+        return await command.ExecuteScalarAsync() is true;
+    }
+
+    public async Task<InboxCheckPackagesResult> CheckInboxPackagesAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return new InboxCheckPackagesResult(false, Array.Empty<object?>());
+
+        // 与官方服务端行为一致：本接口在 present 帧中返回当前未读礼包列表。
+        // 客户端的 HomeModel.InitializeAsync 第二个 await 消费的就是这份列表，
+        // 只返回 hasUnread 标志会让主页/教程收尾阶段停在等待状态。
+        await using var packagesConnection = await database.OpenConnectionAsync();
+        var unreadPackages = await ReadInboxPackagesAsync(packagesConnection, userId.Value);
+        var presentPackages = unreadPackages.Select(value => DataObject(41, value)).ToArray();
+        return new InboxCheckPackagesResult(true, presentPackages);
+    }
+
+    public async Task<InboxReceivePackagesResult> ReceiveInboxPackagesAsync(HttpContext context, IReadOnlyCollection<long>? inboxIds = null)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return new InboxReceivePackagesResult(Array.Empty<object?>(), false, Array.Empty<object?>());
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        // 先取账号锁再锁礼包行，与其它货币路径保持同一锁顺序，避免反向等待。
+        await LockLessonUserAsync(connection, transaction, userId.Value);
+
+        var hasIds = inboxIds is { Count: > 0 };
+        var packages = new List<InboxPackageRecord>();
+        await using (var command = new NpgsqlCommand(
+            hasIds
+                ? """
+                  select id, payload::text, created_at, expires_at
+                  from user_item_inbox_packages
+                  where "userId" = $1
+                    and id = any($2)
+                    and received_at is null
+                    and (expires_at is null or expires_at > now())
+                  order by id for update
+                  """
+                : """
+                  select id, payload::text, created_at, expires_at
+                  from user_item_inbox_packages
+                  where "userId" = $1
+                    and received_at is null
+                    and (expires_at is null or expires_at > now())
+                  order by id for update
+                  """,
+            connection,
+            transaction))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            if (hasIds) command.Parameters.AddWithValue(inboxIds!.ToArray());
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                packages.Add(ReadInboxPackageRecord(reader));
+            }
+        }
+
+        var receivedAt = DateTime.UtcNow;
+        var rewards = new List<object?>();
+        var presentData = new List<object?>();
+        var shouldReadCurrency = false;
+
+        if (packages.Count > 0)
+        {
+            await using (var command = new NpgsqlCommand(
+                """
+                update user_item_inbox_packages
+                set received_at = $3,
+                    updated_at = now()
+                where "userId" = $1
+                  and id = any($2)
+                  and received_at is null
+                """,
+                connection,
+                transaction))
+            {
+                command.Parameters.AddWithValue(userId.Value);
+                command.Parameters.AddWithValue(packages.Select(package => package.Id).ToArray());
+                command.Parameters.AddWithValue(receivedAt);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            foreach (var package in packages)
+            {
+                rewards.Add(BuildRewardResult(package.ThingType, package.MasterId, package.Quantity));
+                presentData.Add(DataObject(41, BuildInboxPackageRow(package, receivedAt)));
+
+                switch (package.ThingType)
+                {
+                    case 1:
+                        var itemPossession = await AddItemPossessionAsync(connection, transaction, userId.Value, package.MasterId, package.Quantity);
+                        presentData.Add(DataObject(27, itemPossession));
+                        break;
+                    case 12:
+                        await AddCoinsAsync(connection, transaction, userId.Value, package.Quantity);
+                        shouldReadCurrency = true;
+                        break;
+                    case 13:
+                        await AddFreeJewelsAsync(connection, transaction, userId.Value, package.Quantity);
+                        shouldReadCurrency = true;
+                        break;
+                    case 6:
+                        // 称号：直接写入 user_trophies，并把最新列表下发给客户端
+                        await using (var trophy = new NpgsqlCommand(
+                            """
+                            insert into user_trophies(id, "userId", trophy_master_id, trophy_group_master_id, current_order)
+                            values ($1, $2, $3, 0, $4)
+                            on conflict (id) do nothing
+                            """, connection, transaction))
+                        {
+                            trophy.Parameters.AddWithValue(userId.Value * 1000000000000L + package.MasterId);
+                            trophy.Parameters.AddWithValue(userId.Value);
+                            trophy.Parameters.AddWithValue(package.MasterId);
+                            trophy.Parameters.AddWithValue(package.Quantity);
+                            await trophy.ExecuteNonQueryAsync();
+                        }
+                        break;
+                }
+            }
+
+            if (shouldReadCurrency)
+            {
+                presentData.Add(DataObject(128, await ReadCurrencyAsync(connection, transaction, userId.Value)));
+            }
+        }
+
+        var hasUnread = false;
+        await using (var command = new NpgsqlCommand(
+            """
+            select exists (
+              select 1
+              from user_item_inbox_packages
+              where "userId" = $1
+                and received_at is null
+                and (expires_at is null or expires_at > now())
+            )
+            """,
+            connection,
+            transaction))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            hasUnread = await command.ExecuteScalarAsync() is true;
+        }
+
+        await transaction.CommitAsync();
+        return new InboxReceivePackagesResult(rewards.ToArray(), hasUnread, presentData.ToArray());
+    }
+
+    static InboxPackageRecord ReadInboxPackageRecord(NpgsqlDataReader reader)
+    {
+        using var document = JsonDocument.Parse(reader.GetString(1));
+        var payload = document.RootElement;
+        var thingType = payload.TryGetProperty("ThingType", out var thingTypeElement) ? thingTypeElement.GetInt32() : 1;
+        var masterId = payload.TryGetProperty("MasterId", out var masterIdElement) ? masterIdElement.GetInt64() : 0L;
+        var quantity = payload.TryGetProperty("Quantity", out var quantityElement) ? quantityElement.GetInt32() : 1;
+        // 负数或越界数量会把"发放"变成扣款，必须在读取时拒绝。
+        if (quantity is < 1 or > MaxInboxQuantity) throw new InvalidDataException("礼物箱数量非法");
+        var message = payload.TryGetProperty("Message", out var messageElement) ? messageElement.GetString() ?? "" : "";
+        return new InboxPackageRecord(
+            reader.GetInt64(0),
+            thingType,
+            masterId,
+            quantity,
+            message,
+            reader.GetDateTime(2),
+            reader.IsDBNull(3) ? null : reader.GetDateTime(3));
+    }
+
+    static object?[] BuildInboxPackageRow(InboxPackageRecord package, DateTime? receivedAt)
+    {
+        return new object?[]
+        {
+            package.Id,
+            package.ThingType,
+            package.MasterId,
+            package.Quantity,
+            package.ExpiresAt is not null,
+            receivedAt is not null,
+            null,
+            package.Message,
+            package.CreatedAt,
+            receivedAt,
+            // 客户端 key10 是非空 DateTime；无限期由 key4=false 表示，不能发送 nil。
+            package.ExpiresAt ?? InboxNoExpiryLimitUtc
+        };
+    }
+
+    static object?[] BuildRewardResult(int thingType, long masterId, int quantity)
+    {
+        return new object?[] { thingType, masterId, quantity, null, null, null, false };
+    }
+
+    static async Task AddCoinsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long userId,
+        int amount)
+    {
+        if (amount < 0) throw new InvalidDataException("礼物箱金币数量非法");
+        // 两张货币表必须同步增量更新，否则主页钱包与商店余额会永久分叉。
+        await ExecuteAsync(connection, transaction,
+            "update user_item_currencies set coin=coin+$2 where \"userId\"=$1", userId, amount);
+        await ExecuteAsync(connection, transaction,
+            "update user_game_states set coin=coin+$2,updated_at=now() where \"userId\"=$1", userId, amount);
+    }
+
+    static async Task<List<object?[]>> ReadInboxPackagesAsync(NpgsqlConnection connection, long userId)
+    {
+        await using var command = new NpgsqlCommand(
+            """
+            select id, payload::text, created_at, received_at, expires_at
+            from user_item_inbox_packages
+            where "userId" = $1
+              and received_at is null
+              and (expires_at is null or expires_at > now())
+            order by id
+            """,
+            connection);
+        command.Parameters.AddWithValue(userId);
+
+        var result = new List<object?[]>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            using var document = JsonDocument.Parse(reader.GetString(1));
+            var payload = document.RootElement;
+            var thingType = payload.TryGetProperty("ThingType", out var thingTypeElement) ? thingTypeElement.GetInt32() : 1;
+            var masterId = payload.TryGetProperty("MasterId", out var masterIdElement) ? masterIdElement.GetInt64() : 0L;
+            var quantity = payload.TryGetProperty("Quantity", out var quantityElement) ? quantityElement.GetInt32() : 1;
+            var message = payload.TryGetProperty("Message", out var messageElement) ? messageElement.GetString() ?? "" : "";
+            var package = new InboxPackageRecord(
+                reader.GetInt64(0),
+                thingType,
+                masterId,
+                quantity,
+                message,
+                reader.GetDateTime(2),
+                reader.IsDBNull(4) ? null : reader.GetDateTime(4));
+            result.Add(BuildInboxPackageRow(package, reader.IsDBNull(3) ? null : reader.GetDateTime(3)));
+        }
+        return result;
+    }
+
+    static async Task<List<object?[]>> ReadInboxPackagesByBootstrapKeysAsync(NpgsqlConnection connection, long userId, IReadOnlyCollection<string> bootstrapKeys)
+    {
+        if (bootstrapKeys.Count == 0) return new List<object?[]>();
+
+        await using var command = new NpgsqlCommand(
+            """
+            select id, payload::text, created_at, expires_at
+            from user_item_inbox_packages
+            where "userId" = $1
+              and payload ->> 'bootstrapKey' = any($2)
+              and received_at is null
+              and (expires_at is null or expires_at > now())
+            order by id
+            """,
+            connection);
+        command.Parameters.AddWithValue(userId);
+        command.Parameters.AddWithValue(bootstrapKeys.ToArray());
+
+        var result = new List<object?[]>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            using var document = JsonDocument.Parse(reader.GetString(1));
+            var payload = document.RootElement;
+            var thingType = payload.TryGetProperty("ThingType", out var thingTypeElement) ? thingTypeElement.GetInt32() : 1;
+            var masterId = payload.TryGetProperty("MasterId", out var masterIdElement) ? masterIdElement.GetInt64() : 0L;
+            var quantity = payload.TryGetProperty("Quantity", out var quantityElement) ? quantityElement.GetInt32() : 1;
+            var message = payload.TryGetProperty("Message", out var messageElement) ? messageElement.GetString() ?? "" : "";
+            var package = new InboxPackageRecord(reader.GetInt64(0), thingType, masterId, quantity,
+                message, reader.GetDateTime(2), reader.IsDBNull(3) ? null : reader.GetDateTime(3));
+            result.Add(BuildInboxPackageRow(package, null));
+        }
+        return result;
+    }
+
+    static async Task<object?[]> ReadLoginBonusStateAsync(NpgsqlConnection connection, long userId)
+    {
+        await using var command = new NpgsqlCommand(
+            """
+            select id, current_count, total_count, shown_at, status
+            from user_login_bonus_states
+            where "userId" = $1
+            """,
+            connection);
+        command.Parameters.AddWithValue(userId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return new object?[] { UserScopedId(userId, 10901), 0, 0, DateTime.UtcNow, 0 };
+        return new object?[]
+        {
+            reader.GetInt64(0),
+            reader.GetInt32(1),
+            reader.GetInt32(2),
+            reader.GetDateTime(3),
+            reader.GetInt32(4)
+        };
+    }
+
+    static object?[] BuildLoginBonusResult(LoginBonusReward reward, int currentLoginCount, bool showReceived = true)
+    {
+        var dailyRewards = Enumerable.Range(1, reward.Days)
+            .Select(day => new object?[] { reward.ThingType, reward.MasterId, reward.Quantity, day })
+            .ToArray();
+
+        return new object?[]
+        {
+            reward.Id,
+            currentLoginCount,
+            showReceived
+                ? new object?[] { new object?[] { reward.ThingType, reward.MasterId, reward.Quantity, null, null, null, false } }
+                : Array.Empty<object?>(),
+            reward.Title,
+            1,
+            reward.StartAt.UtcDateTime,
+            reward.EndAt.UtcDateTime,
+            null,
+            null,
+            null,
+            // message_template：客户端用它渲染每一天的说明（{0} = 第几天）
+            reward.Title + " {0}日目",
+            null,
+            null,
+            null,
+            reward.Days,
+            reward.IsLoop,
+            reward.DisplayOrder,
+            dailyRewards,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            reward.DisplayCategory,
+            null,
+            reward.Id == 10006 ? BuildRegularLoginBonusSpineGroup() : null
+        };
+    }
+}

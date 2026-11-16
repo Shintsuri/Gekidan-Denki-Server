@@ -1,0 +1,246 @@
+# 数据库结构说明
+
+本服务端使用 PostgreSQL 保存本地玩家数据。：
+
+- 用户相关表：`user_xxxxxxx`
+- 用户道具相关表：`user_item_xxxxxx`
+- 用户角色相关表：`user_character_xxxxxxx`
+- 角色静态资源表：`wds_static_character`
+- 道具静态资源表：`wds_static_item`
+- 其他静态资源表：`wds_static_xxxxxx`
+- 其他系统功能表：`system_xxxxxx_xxxxxxx`
+- 用户外键字段统一使用 `"userId"`，不使用 `user_id`
+
+## 用户核心表
+
+`user_accounts` 是账号根表。`id` 是服务端内部用户 ID，`public_id` 是客户端展示用的 10 位玩家 ID。
+
+`user_login_identities` 用于把登录 token hash 映射到 `"userId"`。
+
+`user_auth_sessions` 保存已签发的 API token hash 及过期时间。
+
+`user_confirmation_codes` 按账号保存 nonce、有效期、消费状态和失败次数；确认码由服务端密钥派生，不存储明文。
+
+`user_account_recovery` 按账号保存唯一 10 位引继码、16 字节密码盐、32 字节 PBKDF2-SHA512 哈希、凭据签发 nonce、首次引继标记、失败次数和锁定时间。密码采用 210000 次迭代；账号删除时两张恢复表级联清理。引继码在首次设置引继密码时创建，之后长期保存在库中且不会变更；`claimed` 一旦置为 true 该码立即永久失效，领取时同时把盐与哈希替换为随机值，之后既不能再用该码引继也不能重新设置引继密码（返回 `ACCOUNT_TAKEOVER_ALREADY_USED`，接口回 `{false, ""}`）。引继使用账号行锁，在同一事务内撤销目标账号旧会话和登录凭据、登记替代凭据；失败整体回滚，重试不会影响新会话或其他账号。
+
+`user_states` 保存兼容旧逻辑用的 JSON 状态快照。
+
+`user_game_states` 保存等级、经验、体力、新手教程状态、已读标记、登录时间等游戏进度；新账号以客户端 `TutorialStatus.Start`（0）开始教程，完成状态为 99。启动迁移保留现有教程进度；`stamina_jewel_recovery_count` 对应官方 `key0` 中的钻石恢复体力次数。
+
+`stamina_recovery_checkpoint_at` 保存自然恢复计时起点；每 80 秒恢复 1 点，完整周期在玩家行锁内入账，保留未满周期的余秒，并限制在 `max_stamina`。已超过上限的体力不截断。新增列以迁移时间初始化旧存档，不把历史恢复记录误算成离线收益。满体力开始消耗时重置起点，使用恢复道具或钻石时同步重置。客户端 User key4 为 `MaxStaminaRestoredAt`，下发的是计时起点加尚缺体力对应的恢复时长，不能直接使用历史 `stamina_recovered_at`。
+
+`user_profiles` 保存玩家昵称、简介、主页角色、称号装饰和公开资料设置；`updated_at` 记录资料最后更新时间，启动迁移会为旧数据库补齐该列。
+
+## 角色相关表
+
+`wds_static_character` 保存从 `masterdata-export/CharacterMaster.json` 导入的角色和卡牌 master 数据，原始行会保存在 `payload` 字段中。
+
+`user_character_bases` 保存玩家已拥有的角色基础数据。
+
+`user_character_cards` 保存玩家已拥有的 Actor / 卡牌实例，关联 `"userId"`，并可关联 `user_character_bases(id)`。
+
+`is_favorite` 独立保存 Character key14 的收藏状态，默认 false；旧列 `is_new` 不再误映射为收藏。`POST Characters/SetFavorite` 接收 `[角色实例ID, bool]`，认证后按玩家和实例 ID 原子设置，支持重复请求；成功返回 BooleanResult 与更新后的 union4。登录、升级、Sense、觉醒及故事响应共用序列化，保留收藏。非法参数返回 `CHARACTER_FAVORITE_INVALID_REQUEST`（400），不存在或非本人卡牌返回 `CHARACTER_FAVORITE_CHARACTER_MISSING`（404），均为五帧 MessagePack。
+
+`awakening` 保存觉醒阶段，`display_awakening_status` 独立保存客户端 Character key10 的卡面选择。当前客户端仅四星卡具有独立的 `_1` 卡面；三星及以下觉醒后仍使用 `_0`，觉醒属性正常保留。首次迁移为已有觉醒四星卡启用新卡面；后续迁移保留四星卡选择，并清理旧版误开启的低稀有度标记。首次四星觉醒自动显示新卡面，重复觉醒不覆盖选择。升级、Sense、故事与全量同步共用角色序列化。`Characters/{id}/SwitchCharacterDisplayAwakeningStatusAsync` 认证后原子切换本人已觉醒四星卡，响应 union4；无独立卡面、未觉醒、不存在或不属于账号统一返回 `CHARACTER_AWAKENING_DISPLAY_UNAVAILABLE`（409）。
+
+`skill_level` 对应客户端 `Character.SenseLevel`，默认 1，必须大于等于 1。历史零值由启动迁移修正为 1；已有强化等级保持不变。零值会导致客户端无法匹配 EffectMaster 的等级效果并中断编队刷新。
+
+`Characters/{id}/EnhanceSenseLevel/{target}` 根据 CharacterMaster key14 与 CharacterSenseEnhanceItemGroupMaster 按当前等级累计材料消耗，事务内锁定角色、条件扣库存、更新 skill_level；响应 present 返回 Character union4 与 ItemPossession union27。相同目标重试不重复扣除，跨级材料不足整体回滚。Primary Sense（priority=1）范围 1–5；Secondary Sense 尚未持久化，priority=2 明确拒绝，不能返回虚假成功。非法参数为 `CHARACTER_SENSE_INVALID_REQUEST`（400），角色不存在/不属于账号为 `CHARACTER_SENSE_CHARACTER_MISSING`（404），倒退目标为 `CHARACTER_SENSE_LEVEL_CONFLICT`（409），材料不足为 `CHARACTER_SENSE_ITEM_INSUFFICIENT`（409）；有效会话认证规则与社团写接口一致。
+
+`user_character_costumes` 保存玩家已拥有的服装。
+
+`POST Parties/{srcOrder}/CopyTo/{destOrder}` 使用从 0 开始的 `Party.Order`（`display_index`），不是编队实例 ID；客户端同时传同值 `srcOrder`/`destOrder` 查询参数，有传时必须与路径一致。复制在玩家锁及同一事务中保存角色、海报、饰品、能力开关、队长和 Sense 时轴，保留目标编队及位置 ID、顺序与名称；空位置同步清空，默认卡片别名解析为实际持有实例。返回 BooleanResult 与目标 union6/7，重新加载读取已保存状态。复用 `PARTY_INVALID_PAYLOAD`（400）、`PARTY_NOT_FOUND`（404）、`PARTY_MEMBER_INVALID`（400），认证失败为 `ACCOUNT_UNAUTHORIZED`（401），均为五帧 MessagePack。协议依据为 2.31.1 `ApiClient.Party_CopyParty(int srcOrder,int destOrder)` RVA `0xA395B08`、URI 字符串与 `Party` keys 0–3；目标名称保留为本服复制策略。
+
+`user_character_mission_states` 按玩家、CharacterBaseMasterId、任务主数据 ID 保存服务端已确认次数与已领取阶段，复合主键约束重复状态。演出开始时 `user_live_sessions.character_mission_party` 固定本场真实持有的编队角色；有效结算在原事务内累计公演和 Star Act 次数，重复结算返回缓存而不累加。角色卡牌实际等级、Sense 等级、已读角色故事用于其他可验证任务，未记录的历史演出次数不推测补发。`receiveAllMission`、批量领取及独立的 `receiveKeyMission` 共用账号锁：只对新完成阶段授予主数据星点，更新 CharacterBase、已领取状态并通过 union5/96 同步。无任务进度时返回零新增星点；未知角色返回 `CHARACTER_MISSION_CHARACTER_MISSING`（404），非法批量参数返回 `CHARACTER_MISSION_INVALID_REQUEST`（400）。
+
+`user_home_display_preferences` 保存主页展示角色和服装布局。
+
+## 道具相关表
+
+`wds_static_item` 保存从 `masterdata-export/ItemMaster.json` 导入的道具 master 数据，原始行会保存在 `payload` 字段中。
+
+`user_item_currencies` 保存免费剧宝石、付费剧宝石和金币数量。
+
+`user_item_possessions` 保存玩家持有的普通道具数量。每个 `"userId"` 和 `item_master_id` 组合唯一。
+
+`user_item_inbox_packages` 保存礼物箱或收件箱中的奖励及领取状态；`updated_at` 记录最后更新时间，启动迁移会为旧数据库补齐该列。
+
+## 社团相关表
+
+`system_circles` 保存实际创建的社团及名称、简介、活动时间、加入条件、偏好和 MessagePack 横幅。唯一的 `"ownerUserId"` 关联创建者。`id` 是内部 GUID，不用于客户端标签；`display_id` 通过 `system_random_circle_display_id()` 随机生成唯一 8 位数字（10000000–99999999）。唯一索引仲裁并发碰撞，创建语句发生冲突时有界重试。旧递增编号启动时一次性改为随机编号，`previous_display_id` 保留旧数字编号作为查询别名；通过 identity 标记判断是否需要迁移，后续启动保持随机编号稳定，不改写社团主键或成员外键。查询和横幅更新兼容旧 GUID、旧数字编号及新显示 ID。
+
+`user_circle_memberships` 保存成员所属社团和权限，主键 `"userId"` 保证一个玩家最多属于一个社团；`circle_id` 外键和索引用于读取成员。创建社团和写入会长成员关系在同一事务中完成，账号行锁串行化同一玩家的并发创建，相同参数重试返回同一社团，不重复写入。
+
+`Circles/RecommendUsers` 返回真实公开且未入会玩家，限制 50 人；使用社团申请列表相同的有效会话、社团存在性与管理员权限检查，遵循 CircleSearchResult 三字段和五帧协议。
+
+客户端 `User.CircleId`（key11）通过成员表关联社团并读取 `display_id`，创建响应通过 User union0 即时同步，重新登录也保持一致。表由启动迁移自动创建，不改写已有账号数据。删除账号或社团时对应记录按外键级联清理。
+
+## 好友相关表
+
+`user_friend_relationships` 保存已经成立的好友关系。好友关系会保存为两条方向记录，因此每个玩家都可以独立保存收藏好友等本地状态。
+
+`user_friend_requests` 保存好友申请历史。`"fromUserId"` 是申请发送者，`"toUserId"` 是申请接收者，`status` 通常为 `pending`、`accepted`、`denied` 或 `cancelled`。
+
+`user_friend_blocks` 保存玩家黑名单。拉黑时会移除双方之间冲突的待处理申请和已成立好友关系。
+
+## 抽卡相关表
+
+`user_gacha_histories` 保存持久化抽卡记录。字段会记录 `"userId"`、`gacha_detail_master_id`、结果类型、结果 master id、稀有度、是否 pickup、抽取时间等信息。
+
+抽卡获得的角色或道具会同步写入对应的用户角色表或用户道具表，而 `user_gacha_histories` 作为客户端展示抽卡历史的记录来源。
+
+## 主页与通知表
+
+`system_game_operations` 以单行 JSONB 保存 Mission Pass、卡池和每日登录奖励配置，`revision` 为单调递增版本。管理保存通过版本比较防止覆盖；发奖先持有配置行共享锁，再取得账号锁，事务提交后才允许配置切换。主数据版本包含配置版本，避免客户端沿用旧活动缓存。配置校验失败为 `OPERATIONS_INVALID_CONFIG`（400）、并发旧版本为 `OPERATIONS_REVISION_CONFLICT`（409）、非本机/非同源提交为 `OPERATIONS_FORBIDDEN`（403），未预期失败为 `OPERATIONS_SAVE_FAILED`（500）。
+
+`user_login_bonus_claims` 按 `"userId"`、`login_bonus_id`、`game_day` 唯一记录各签到活动的领取。`game_day` 按日本时间 05:00 划分；领取记录、礼物箱写入与旧签到状态更新在同一账号事务内提交。启动迁移从旧礼物箱的签到标识回填记录，首次迁移额外保留旧常规签到最后一次领取日，避免已清理礼物箱的旧账号重复领取。已发满天数的特殊活动不会因开关重置。
+
+`user_home_bgms`、`user_home_skins`、`user_home_skin_possessions` 保存主页 BGM、主页皮肤和皮肤持有状态。
+
+`system_notifications` 保存面向所有玩家展示的系统公告。公告正文以客户端可读取的 JSON body 保存。
+
+公告管理合并至 `/admin/operations/`，`system_notifications.revision` 为每条公告的乐观锁版本，编辑时按 ID/版本比较更新，防止覆盖其他页面的修改。保存验证真实横幅白名单、正文块、分类、展示时间和长度；失败代码为 `NOTIFICATION_INVALID`（400）、`NOTIFICATION_BANNER_UNAVAILABLE`（400）、`NOTIFICATION_REVISION_CONFLICT`（409）。下架使用 `ends_at`，保留公告和阅读记录。
+
+新增往期卡池时，迁移只给 `system_game_operations.payload.gachas` 补齐缺少的 ID，往期池默认关闭，并递增配置版本；已存在开关保持不变，不覆盖管理员手动开启的池。新配置仅默认开放全角色池 1888、全海报池 2860。客户端 master 与卡池列表过滤缺资源池，抽卡和兑换同样校验，不能绕过管理开关或资源要求。
+
+`user_notification_reads` 保存每个玩家对系统公告的已读时间。`user_notification_states` 保存三个公告分类的阅读时间，通过 union94 同步客户端。读取 `ReadNotificationPayload` 时严格使用 key0 的分类和 key1 的时间，不将分类编号解析为 Unix 时间；非法请求为 `NOTIFICATION_INVALID_READ_REQUEST`（400）。分类和单条记录均采用单调更新，延迟请求不能回退已读时间，每日刷新不会清除状态；尚未发布或在阅读时间之后更新的公告不会被提前标记。此前错误保存为 1970 年的记录，启用修复版后重新阅读即可更新，不推测补写玩家未确认的阅读状态。
+
+## 其他系统表
+
+`system_invite_codes` 保存邀请码状态。
+
+`system_live_sessions` 保存本地 Live 游玩和结算状态。
+
+`system_multi_rooms` 保存本地多人房间状态，`"ownerUserId"` 关联 `user_accounts(id)`。
+
+## 初始化行为
+
+服务端启动时，`DatabaseMigrator` 会自动创建缺失的表和索引。
+
+如果 master data 文件存在，启动时会把 `CharacterMaster.json` 导入 `wds_static_character`，把 `ItemMaster.json` 导入 `wds_static_item`。
+
+玩家注册或首次认证时，`UserDataService.InsertDefaultUserDataAsync` 会创建默认档案、游戏状态、初始角色、初始卡牌、初始服装、队伍、货币、主页设置和默认道具。
+
+## 社团剧场体力
+
+`user_circle_memberships.stamina_last_received_at` 记录每位成员上次领取剧场体力的时间。新成员首次领取按 300 点上限计算；之后按 `CircleTheaterLevelMaster.StaminaBaseValue × 完整小时 / 24` 向下取整累计、最多 300 点。剧场等级为四个剧团支援等级之和。领取按账号、钱包、社团、成员顺序加锁，在同一事务中更新时间与玩家体力，重复或并发请求不会重复发放。
+
+`system_circles.is_publish_ranking` 保存社团排行榜公开开关，仅会长可通过社团接口修改。支援剧团等级上限初始为 10，对应主数据首个可解锁上限 11；客户端不应看到 0/0 MAX。
+
+## 表关系概览
+
+```mermaid
+erDiagram
+    user_accounts ||--o{ user_login_identities : "拥有"
+    user_accounts ||--o{ user_auth_sessions : "拥有"
+    user_accounts ||--|| user_game_states : "游戏状态"
+    user_accounts ||--|| user_profiles : "玩家资料"
+    user_accounts ||--o{ user_character_bases : "拥有角色"
+    user_accounts ||--o{ user_character_cards : "拥有卡牌"
+    user_accounts ||--o{ user_character_costumes : "拥有服装"
+    user_accounts ||--o{ user_item_possessions : "拥有道具"
+    user_accounts ||--|| user_item_currencies : "货币"
+    user_accounts ||--o{ user_item_inbox_packages : "收件奖励"
+    user_accounts ||--o{ user_friend_relationships : "好友关系"
+    user_accounts ||--o{ user_friend_requests : "好友申请"
+    user_accounts ||--o{ user_gacha_histories : "抽卡记录"
+    system_notifications ||--o{ user_notification_reads : "已读状态"
+```
+
+## 乐曲收藏状态
+`user_music_bookmarks` 保存 key 146 的乐曲收藏夹状态，`bookmark_state` 与官方 `/api/Lives/Music/EditBookmark` 的第二个请求值保持一致；`0` 表示移出收藏夹，`1/2/4` 等值按客户端原样保存。
+
+## 商店浏览状态
+`user_shop_last_views` 保存 key 65 的商店/活动页最后浏览时间，由 `/api/Shops/UpdateLastViewedAt` 按客户端请求自适应更新，并在 `/api/data/user` 中回放。
+
+## Live 与奖励计算相关表
+`wds_static_live`、`wds_static_additional_reward_package`、`wds_static_audition_reward_package`、`wds_static_episode_reward_package`、`wds_static_league_play_reward_package`、`wds_static_league_reward_package` 保存 Live、剧情和联赛奖励计算所需的 MasterData。数组字段暂以 `payload` 或 `rewards` JSONB 保留，避免在字段语义未完全确认前写错列名。
+
+`user_live_play_results` 保存 key 24 的谱面成绩：`achievement_rate` 为最佳达成率，`notation_rate` 为最佳谱面 rate，`clear_lamp` 为通关灯，`rate_grade` 为评级；旧分数字段保留，不将其误当成达成率。玩家 rating 从难度 1–4 的最高 30 个谱面 rate 汇总，没有成绩时为 0。自动演出不写入手动成绩；未通关或最终 LIFE 为 0 时不产生谱面 rate。计算规格按用户指定的 https://gamerch.com/world-dai-star/786842 实现。
+
+`user_live_sessions` 记录每个玩家当前演出的谱面、自动演出标志、MessagePack 开演快照 `start_snapshot` 和请求摘要 `start_hash`，缓存结算结果和提交摘要，保证重复结算不重复发放奖励。快照版本 2 为 `[2, ordinary, baseStamina, requestedMagnification, effectiveMagnification, staminaBefore, liveUnit, settingId]`；仍兼容不含 `settingId` 的版本 1，按普通设置 1 读取。开演在玩家行锁内按实际可用体力确定倍率并立即扣除，同一未完成开演请求重放原快照，不重复扣费。`live_mode` 区分普通（0）、Ghost（1）、多人（2）、公演（3）；`mode_context` 保存本场 Ghost 对手快照、多人房间演出 ID 或公演上下文。公演上下文为 `[1, auditionMasterId, partySnapshot]`，开演请求自身的公演 ID 纳入摘要，生成的队伍快照在首次成功开演时冻结，重复开始重放原快照。结束或退出后可以开始下一场；退出不退还开演体力。不同开演请求会替换当前记录；客户端的 Finish 请求没有演出 ID，不能区分新演出开始后迟到的旧结算请求。
+
+`user_ghost_lives` 以 `userId` 为主键保存匹配资料 `matching`、本服 NPC 目标分 `rival_score` 和累计胜场 `win_count`。开演将对手冻结至会话上下文；结算胜场、奖励和完成缓存共用事务与玩家锁。当前多人房间仅在进程内保存，不支持跨进程匹配或重启恢复房间。
+
+`user_game_states.rank_limit` 是等级上限，初始 50，和 `max_stamina` 分开存储。升级按 `PlayerRankMaster` 消耗经验并恢复体力，达到上限后经验最多保留至门槛减 1。旧存档中超出门槛的经验在读取前归一化，不清空存档。普通演出基础经验等于快照中的实际体力消耗；结算只累加升级恢复体力，不再次扣除消耗。开演响应同步 union0。
+
+普通材料和金币采用歌曲基础体力与 0～10 档奖励倍率计算，材料按 `LiveSettingMaster` 所引用的 `LiveDropFrameGroupMaster` 筛选普通奖励框、分数门槛、体力条件和有效期，数量最终向下取整。多个框掉落相同道具时累加持有量，金币同时写入两份既有余额。候选没有独立权重时使用本服等概率选择，随机饰品框不发放。奖励加成叠加和高分段行为仍待核实；Mission Pass 沿用既有积分策略，特殊演出保留旧奖励路径。
+
+普通手动演出在支持的完整逐音符结算中，使用开演队伍快照重算基础分，再保留既有 Sense 与 Star Act 记录加分；动态基础分效果、中途生命归零、额外加分记录和汇总结算仍沿用原有分数处理。启动迁移仅追加两个可空快照列；旧版未完成会话需要重新开演，旧版已完成会话仍可重放结算缓存。公式、边界与回归记录见 `devlog/2026-10-18-live-settlement.md`。
+
+`user_live_music_states` 保存 union25 的乐曲状态，唯一键为 `(userId, music_master_id)`，实例 ID 按玩家和歌曲稳定生成。`is_unlocked` 对应 Music key9 的 `IsPossession`；新增 `stella_released` 对应 key5，`olivier_release_status` 对应 key8（0 未开放、1 可挑战、2 可购买、3 已购买）。启动执行 `MusicUnlockSchema` 非破坏迁移，保留已有拥有状态；默认歌曲初始化为已拥有，付费歌曲需要实际兑换。
+
+STELLA：已拥有歌曲的 EXTRA 手动通关、最终 LIFE > 0 且 GOOD/BAD/MISS 合计不超过对应 `LiveMaster.UnlockValue`（当前为 10）时保存解锁；无条件谱面、玩家等级 >= 20，或已购买 OLIVIER >= 20 张同样开放已拥有歌曲的 STELLA。自动与失败演出不写入判定解锁。
+
+OLIVIER：已拥有歌曲 STELLA 手动通关且达成率 >= 100% 后变为可挑战；手动通关 OLIVIER 且最终 LIFE > 0 后，根据主数据难度等级开放同级及以下谱面的购买。购买仍需拥有歌曲并开放 STELLA，消耗 1 张 `130001`（歌劇目録）后变为 3；非默认歌曲消耗 10 张。玩家状态行锁、条件扣票和解锁更新在同一事务内完成，重复购买返回当前状态，不再次扣票。普通单人演出检查拥有/解锁状态；协力及活动保留借用歌曲入口，借用不会获得歌曲永久拥有、STELLA 或挑战资格。
+
+union130 的 `LiveAchievement` 按存档计算 `[userId, 已购买OLIVIER数量, 最高通关OLIVIER等级]`。登录、开始、结算和兑换同步真实 union25/130；不再使用演出开始的随机实例 ID 或固定未解锁字段覆盖客户端缓存。既有结算缓存仍保证重试不重复发奖；缓存重放时刷新 union25/130，迟到结算不会覆盖后续谱面购买。旧版本从未保存的购买响应及逐场判定无法可靠恢复，不凭猜测补发拥有状态或判定解锁。
+
+逆向依据为 2.31.1 ARM64 客户端 `split_config.arm64_v8a/lib/arm64-v8a/libil2cpp.so`（SHA256 `5974E6BCEC37B2D9D41C3353BD111EB92723228CA02DCB7659FFCFE965C66DAA`）与匹配的 Il2CppDumper 输出：`LiveHelper.IsStellaReleased` RVA `0xACA72AC` 验证拥有状态、条件类型与 rank > 19；`MusicSelectionPresenter.<OnLongTapDifficultySelected>.MoveNext` RVA `0xADD13FC` 的 `0xADD1AA4–0xADD1AB0` 比较 ILive.AchievementRate 与 float 100.0，随后要求 Music.OlivierReleaseStatus == 1；`MusicShopModel.CreateMusicLiveProductParameter` RVA `0xB6D16B4` 使用道具 130001、数量 1。主数据 `UnlockConditionMaster[13]` 给出 EXTRA 的 GOOD 以下 <= 10 和 OLIVIER 20 张条件，`LiveMaster` 与 `MusicMaster` 提供谱面关联及默认/购买条件。客户端 `Music` MessagePack keys 5/8/9 和 `LiveAchievement` union130 定义用于同步，`StartLivePayload` 没有独立的 OLIVIER 挑战标志。
+
+工作区现有检查工具 `tools/ProgressionChecks` 新增 `--database --music-unlocks`：覆盖 GOOD 10/11、rank 19/20、OLIVIER 19/20 张、100% 挑战门槛、失败/自动/LIFE=0、商店等级范围、并发结算/购买、余额不足、五帧协议、重登录、借用歌曲及账号隔离。测试使用临时账号并在结束后清理。
+`user_live_lesson_party_states` 保存 key 39 的稽古队伍状态。`user_live_course_states` 是旧版预留的课程状态表，当前不作为 union90 的数据来源；客户端 union90 已确认为 `AuditionClear`。
+
+## 公演进度与历史队伍
+
+`user_audition_clears` 按玩家和公演唯一保存最高通关阶段 `clear_phase`，登录与结算映射为六字段 union90。`skip_clear_phase` 预留为协议要求的跳过进度，当前没有跳过入口，默认 0。启动 `AuditionSchema` 仅新增表与索引，不从普通谱面高分推测历史公演成绩。
+
+`user_audition_parties` 按玩家、公演、阶段唯一保存分数和 MessagePack 队伍快照：阶段 0 为本人手动演出的最高分（包括失败场次）；阶段 1 起为分别达到该阶段条件的最高分队伍。只有更高分才替换快照，同分保持原队伍。快照遵循客户端 11 字段队伍、15 字段成员协议，冻结开演时角色、装备、数值、昵称、等级与领队。查询展示每阶段分数最高的五支真实通关队伍，以记录 ID 稳定处理同分；此选样策略为本服实现。索引覆盖公演、阶段、分数和 ID，查询按阶段使用有界索引读取。
+
+公演通过 `/Lives/Start` payload key2 识别，验证歌曲、难度、展示时间与冲突模式，使用主数据指定的 Sense 时轴。有效手动通关按分数和唯一有效 Star Act 触发次数逐阶段推进；自动/失败不推进，自动也不写入公演最高分。首次通关奖励、进度、历史快照、普通奖励及完成缓存处于同一事务和玩家锁中，宝石同步两份既有余额。重试不重复发奖。汇总格式分数沿用既有结算行为，支持的逐音符/静态技能格式使用开演数值复算。
+
+`CopyTo` 只复制本人最高分至本人持有编队，按角色/装备主数据 ID 解析当前持有实例，使用当前养成状态，不回滚养成等级；装备已不存在时整笔复制拒绝并回滚。错误码集中于 `AuditionErrors`：`AUDITION_NOT_FOUND`/`AUDITION_PARTY_NOT_FOUND` 对应 404，`AUDITION_INVALID_START` 对应 400，`AUDITION_PARTY_UNAVAILABLE` 对应 409，均返回五帧 MessagePack；逐音符/Star Act 非法记录复用 `LIVE_INVALID_FINISH`。完整依据及未还原规则见 `devlog/2026-10-20-auditions.md`。
+
+## 活动、商店和媒体状态表
+`user_story_event_states` 保存 key 101 的活动点数、排名和提示阅读状态。`user_event_exchange_shop_states` 保存 key 102 的活动兑换商店兑换次数。`user_shop_purchase_states` 保存 key 108 的商店购买次数和限购刷新状态。`user_episode_read_states` 保存 key 95 的剧情阅读状态。`user_comic_read_states` 保存漫画阅读的集数与发奖标记（每集只发一次 30 免费宝石）。`user_photo_records` 保存 key 123 的生成照片记录。`user_photo_states` 保存 key 124 的照片系统状态。`user_music_video_watch_states` 保存 key 131 的音乐视频观看状态。`user_raw_union_states` 作为 key 193 等尚未确认语义的用户状态兜底表。
+`user_photo_album_arrangements` 保存 key 125 的相册简单/详细布局，`layout_payload` 以嵌套 MessagePack 二进制保存客户端布局，避免丢失位置、缩放、旋转等字段。
+
+## 官方 data/user 玩家状态补充表
+`system_master_data_versions` 保存当前启用的 MasterData 版本、发布时间戳、本地文件路径和远程路径。
+`user_player_preferences` 保存 key 2 的玩家偏好，例如当前选中的队伍。
+`user_party_groups` 保存 key 6 的队伍分组。
+`user_party_slots` 保存 key 7 的队伍槽位。
+`user_character_resource_progress` 保存 key 96 的角色资源/解锁进度。
+`user_mission_statuses` 保存 key 48 的任务状态。
+`user_live_user_stats` 保存 key 67 的玩家 live 统计值。
+`user_player_settings` 保存 key 97 的玩家设置。
+`user_restriction_states` 保存 key 148 的账号限制状态。
+`user_album_groups` 保存 key 174 的相册分组。
+`user_invite_states` 保存 key 179 的邀请码状态。
+`user_login_bonus_states` 保存 key 109 的登录/活动展示状态。
+`user_notification_states` 保存 key 94 的通知已读状态。
+`user_game_hint_reads` 保存 key 66 的游戏提示已读状态。
+
+`user_live_lesson_party_states` 保存每个账号、角色的稽古编队，以及领队位置、历史高分和已领取奖励门槛。`user_lesson_sessions` 保存当前稽古角色、谱面、开始时间、开始时的队伍及卡片快照、完成响应和结算摘要；每个账号一行，用于定位不带角色 ID 的结算请求并保证重试幂等。
+
+稽古 `completion` 保存 `[FinishLiveResult, PresentData]`，两个结束入口重放同一事务结果；兼容旧版本仅保存 PresentData 的完成记录。普通演出与稽古按最近开始时间分流，并共用玩家行锁。
+
+常设商店复用 `user_raw_union_states` 保存协议对象：149 为商品购买次数，45/129 为铭牌和装饰持有，182 为头像框集合；购买在玩家行锁下与货币/道具更新一起提交，不新增存储表。
+
+稽古开始快照新增第三项卡片战力映射 `[LessonParty, Cards, StatusByCardId]`，卡片 ID 以十进制字符串作为映射键。旧版两项快照在读取未完成场次时补存第三项，不更改次数或奖励。战力采用解包 CharacterMaster、CharacterLevelMaster、CharacterBloomBonusGroupMaster、EffectMaster 与 CharacterStarRankMaster；星章加成为 `min(当前星章加成, 高分满足的最大加成)`，高分缺省为 0 时上限 2.5%。
+
+剧情进度：`user_episode_read_states` 一条记录表示已读，key95第二字段为 `has_read_all`（非 is_new）。新增列默认false，ReadAll只能升级为true；重复Read不降级。前置剧情、一次性奖励和已读写入在玩家状态行锁与同一事务内处理。主数据奖励类型1/13发放道具/免费宝石，3海报持有状态保留旧版 raw 存档编号28，读取时映射为客户端 Poster union11（客户端28实际为 AccessoryEffectMaster），不批量改写存档。8铭牌保存在45。两份宝石余额同步，重登录包含11与95。旧教程已读记录不重复补发奖励。
+
+海报升级按实例 ID 定位已拥有的 Poster，只修改等级并保留主数据、突破及其他字段。`PosterMaster` 的稀有度、升级模式及最大突破数和 `PosterLevelPatternGroupMaster` 决定等级上限与逐级材料；等级上限为 `rarity * 2 + (phase <= 4 ? phase : phase * 2 - 4)`。玩家行锁内扣费与保存同一事务，重复或迟到的目标等级不降级、不重复扣费；不足材料时全部回滚。错误码为 `POSTER_INVALID_REQUEST`（400）、`POSTER_NOT_OWNED`（404）、`POSTER_LEVEL_LIMIT` / `POSTER_INSUFFICIENT_ITEMS`（409）。
+
+海报的服装奖励按 `PosterMaster.Costumes` 中已达到的突破阶段写入 `user_character_costumes`，使用已有 `(userId,costume_master_id)` 唯一约束保证幂等，响应包含 union43。共用海报发奖入口覆盖抽卡、兑换和 Mission Pass，剧情海报同样处理；登录按现存海报的真实突破阶段补齐旧服装，不推断未保存的升级或突破。
+
+普通 OLIVIER 开演响应的 `LiveUnit` key8 根据实际歌曲状态生成：手动且拥有歌曲、状态为 1（可挑战）时为 true；STELLA、自动和已购买 OLIVIER 为 false。客户端长按 STELLA 后仅设置本地 `IsOlivierChallenge` 并播放动画，编队仍显示 STELLA；`PartyFinalConfirmationModel.StartLiveAsync`（2.31.1 RVA `0xAB89768`）在开演时选择同曲 difficulty5 并关闭自动模式。
+
+## Mission Pass
+
+`user_mission_passes` 按 `("userId", mission_pass_master_id)` 唯一保存普通/SP 已领取阶段及各自已领取循环奖励数，账号删除时级联清理。`sp_purchased` 记录 SP 轨购买凭据：没有该凭据的账号即使总开关 `SpEnabled` 打开也不会领取 SP 轨奖励，只能看到进度。积分复用 `user_item_possessions` 中的 432607；既有积分直接保留，旧版固定领奖响应没有可靠领取记录，首次升级不据此推断已领取阶段。
+
+客户端 union 97 读取该表，11 个字段依次为 ID、玩家 ID、通行证主数据 ID、SP 开放标记、普通阶段、SP 阶段、终止标记、普通循环轮次/阶段、SP 循环轮次/阶段。当前最后一期常驻并免费开放 SP，循环轮次从 1 起、阶段为 0–3，领完一轮进入下一轮的阶段 0。旧 `user_player_settings` 表保留原数据，但不再误映射为 union 97。
+
+领奖、积分兑换与演出结算共用玩家行锁；奖励、两份钱包余额及领取阶段在同一事务内提交。积分兑换拒绝非正单位、余额不足和超过主数据积分上限的请求。公开错误码为 `MISSION_PASS_UNAVAILABLE`（404）、`MISSION_PASS_INVALID_REQUEST`（400）、`MISSION_PASS_INSUFFICIENT_JEWELS`（409）、`MISSION_PASS_POINT_LIMIT`（409）。
+
+## 社团管理与支援
+
+`system_circle_entries` 保存邀请/申请、处理状态与客户端操作编号，重复待处理请求返回原编号；拒绝或取消后重新提交生成新编号，旧审批不能作用于新请求。入会、审批、踢出、退会、权限移交与解散复用账号和社团行锁，保证成员唯一性、权限与人数上限。
+
+`system_circle_support` 保存四个剧团的等级、当前积分、等级上限和共同捐赠金币；`system_circle_support_donations` 保存材料进度。捐赠按已发布上限主数据扣款，超额部分保留在玩家钱包，满足金币及全部材料条件后解放上限并清零当前捐赠进度。钱包、材料与共同进度在同一事务内提交。
+
+`user_circle_support_points` 按玩家、社团、日本时间 05:00 刷新日保存贡献。日/周/月排行只查询当前玩家所属社团的现有成员，离线成员同样参与，按周期累计积分排名。演出贡献产出公式尚未还原，普通演出结算暂不写入贡献；排行榜不会把玩家等级或全服成绩冒充贡献积分。
+
+`user_circle_memberships.support_company` 保存支援选择，0 表示指定なし，1–4 为四个剧团；`authority_update_type` 保存权限变更提示。`user_profiles.is_public_activity_log` 控制个人非管理活动日志公开性。

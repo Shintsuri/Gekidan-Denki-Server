@@ -1,0 +1,506 @@
+using System.Text.Json;
+using Npgsql;
+
+sealed partial class UserDataService
+{
+    const string ProfileFavoriteCharacterInvalid = "PROFILE_FAVORITE_CHARACTER_INVALID";
+    public async Task<object?[]> GetCurrentUserProfileDetailAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return BuildUserProfileDetail(null, "LocalPlayer", DefaultCharacterMasterId, 1, false, DefaultIconFrameMasterId, DefaultNameColorMasterId, DefaultNameBaseColorMasterId, null);
+
+        await EnsureDefaultUserDataAsync(userId.Value);
+        return await ReadUserProfileDetailAsync(userId.Value);
+    }
+
+    public async Task<object?[]> EditProfileAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null || payload is not object?[] rawValues) return Array.Empty<object?>();
+        var values = rawValues is [object?[] nestedValues] ? nestedValues : rawValues;
+
+        await EnsureDefaultUserDataAsync(userId.Value);
+
+        var name = GetString(values, 0);
+        var introduction = GetString(values, 1);
+        var favoriteCharacterId = GetLong(values, 2);
+        var nameplateId = GetNullableLong(values, 3);
+        var nameColorId = GetLong(values, 4);
+        // 资料页装备的三个称号（客户端 payload[5]/[6]/[7] → MTrophyId1/2/3）
+        var trophyId1 = GetNullableLong(values, 5);
+        var trophyId2 = GetNullableLong(values, 6);
+        var trophyId3 = GetNullableLong(values, 7);
+        var isPublic = GetBool(values, 8);
+        var displayAwakening = GetBool(values, 9);
+        var mainCharacterMasterId = GetLong(values, 10);
+        var nameBaseColorMasterId = GetLong(values, 11);
+        var iconFrameMasterId = GetLong(values, 12);
+        var homeSkinMasterId = GetLong(values, 13);
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        if (favoriteCharacterId is not null && favoriteCharacterId != 0)
+        {
+            await using var favoriteCommand = new NpgsqlCommand(
+                "select id from user_character_cards where id = $1 and \"userId\" = $2 for key share", connection, transaction);
+            favoriteCommand.Parameters.AddWithValue(favoriteCharacterId.Value);
+            favoriteCommand.Parameters.AddWithValue(userId.Value);
+            if (await favoriteCommand.ExecuteScalarAsync() is null)
+                throw new BadHttpRequestException(ProfileFavoriteCharacterInvalid, StatusCodes.Status400BadRequest);
+        }
+        await using var command = new NpgsqlCommand(
+            """
+            update user_profiles
+            set display_name = coalesce($2, display_name),
+                comment = coalesce($3, comment),
+                favorite_character_id = case when $4::bigint is null then favorite_character_id else nullif($4::bigint, 0) end,
+                nameplate_master_id = $5::bigint,
+                name_color_master_id = case when $6 > 0 then $6 else name_color_master_id end,
+                is_public = coalesce($7, is_public),
+                is_home_character_illust = $8::boolean,
+                home_character_master_id = case when $9 > 0 then $9 else home_character_master_id end,
+                name_base_color_master_id = case when $10 > 0 then $10 else name_base_color_master_id end,
+                icon_frame_master_id = case when $11 > 0 then $11 else icon_frame_master_id end,
+                home_skin_master_id = case when $12 > 0 then $12 else home_skin_master_id end,
+                trophy_master_id_1 = $13::bigint,
+                trophy_master_id_2 = $14::bigint,
+                trophy_master_id_3 = $15::bigint,
+                updated_at = now()
+            where "userId" = $1
+            """,
+            connection, transaction);
+        command.Parameters.AddWithValue(userId.Value);
+        command.Parameters.AddWithValue((object?)name ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)introduction ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)favoriteCharacterId ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)nameplateId ?? DBNull.Value);
+        command.Parameters.AddWithValue(nameColorId ?? 0L);
+        command.Parameters.AddWithValue((object?)isPublic ?? DBNull.Value);
+        command.Parameters.AddWithValue(displayAwakening ?? false);
+        command.Parameters.AddWithValue(mainCharacterMasterId ?? 0L);
+        command.Parameters.AddWithValue(nameBaseColorMasterId ?? 0L);
+        command.Parameters.AddWithValue(iconFrameMasterId ?? 0L);
+        command.Parameters.AddWithValue(homeSkinMasterId ?? 0L);
+        command.Parameters.AddWithValue((object?)trophyId1 ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)trophyId2 ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)trophyId3 ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+        // 客户端的 0 表示取消选择；数据库使用 NULL 表示无角色，不能写入外键 0。
+        var profile = await ReadProfileAsync(connection, userId.Value);
+        await transaction.CommitAsync();
+
+        return new object?[] { DataObject(1, profile) };
+    }
+
+    public async Task<string> GetCurrentUserPushTokenAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return "100000";
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "select numeric_id from user_accounts where id = $1",
+            connection);
+        command.Parameters.AddWithValue(userId.Value);
+
+        var value = await command.ExecuteScalarAsync();
+        return value is int numericId ? numericId.ToString("D6") : FormatNumericId(userId.Value);
+    }
+
+    public async Task UpdateHomeLastTransitionTimeAsync(HttpContext context)
+    {
+        await UpdateUserGameStateTimestampAsync(context, "home_last_transition_at");
+    }
+
+    public async Task UpdateSplashLastDisplayTimeAsync(HttpContext context)
+    {
+        await UpdateUserGameStateTimestampAsync(context, "splash_last_displayed_at");
+    }
+
+    public async Task<object?[]> UpdateBirthDateAsync(HttpContext context, object? payload)
+    {
+        var userId = await RequireAuthenticatedUserAsync(context);
+        var birthDate = ExtractFirstDateTime(payload);
+        if (birthDate is null || birthDate.Value.Date > DateTime.UtcNow.Date)
+            throw new BadHttpRequestException(AccountErrors.InvalidBirthDate, 400);
+        await EnsureDefaultUserDataAsync(userId);
+        var date = DateTime.SpecifyKind(birthDate.Value.Date, DateTimeKind.Utc);
+        var seconds = new DateTimeOffset(date).ToUnixTimeSeconds();
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await LockLessonUserAsync(connection, transaction, userId);
+        await ExecuteAsync(connection, transaction,
+            "update user_profiles set birthday=$2,updated_at=now() where \"userId\"=$1", userId, (double)seconds);
+        var preference = await ReadUserPreferenceAsync(connection, userId);
+        await transaction.CommitAsync();
+        return new object?[] { DataObject(2, preference) };
+    }
+
+    public async Task<object?[]> UpdateNotificationReadTimeAsync(HttpContext context, object? payload = null)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return Array.Empty<object?>();
+
+        var (tabCategory, readAt) = PayloadReaders.ReadNotificationReadPayload(payload);
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        await using (var command = new NpgsqlCommand(
+            """
+            insert into user_notification_states (
+              "userId",
+              notification_read_at,
+              notice_read_at,
+              present_read_at,
+              updated_at
+            )
+            values (
+              $1,
+              case when $3 = 1 then $2 else null end,
+              case when $3 = 2 then $2 else null end,
+              case when $3 = 3 then $2 else null end,
+              now()
+            )
+            on conflict ("userId")
+            do update set
+              notification_read_at = case
+                when $3 = 1 then greatest(user_notification_states.notification_read_at, excluded.notification_read_at)
+                else user_notification_states.notification_read_at
+              end,
+              notice_read_at = case
+                when $3 = 2 then greatest(user_notification_states.notice_read_at, excluded.notice_read_at)
+                else user_notification_states.notice_read_at
+              end,
+              present_read_at = case
+                when $3 = 3 then greatest(user_notification_states.present_read_at, excluded.present_read_at)
+                else user_notification_states.present_read_at
+              end,
+              updated_at = now()
+            """,
+            connection,
+            transaction))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            command.Parameters.AddWithValue(readAt);
+            command.Parameters.AddWithValue(tabCategory);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using (var command = new NpgsqlCommand(
+            """
+            insert into user_notification_reads ("userId", notification_id, read_at)
+            select $1, id, $2
+            from system_notifications
+            where notification_tab_category = $3
+              and greatest(posting_at, last_updated_at) <= $2
+              and starts_at <= now() and (ends_at is null or ends_at > now())
+            on conflict ("userId", notification_id)
+            do update set read_at = greatest(user_notification_reads.read_at, excluded.read_at)
+            """,
+            connection,
+            transaction))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            command.Parameters.AddWithValue(readAt);
+            command.Parameters.AddWithValue(tabCategory);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
+        return new object?[]
+        {
+            DataObject(94, await ReadNotificationAsync(connection, userId.Value))
+        };
+    }
+
+    public async Task<object?[]> UpdateGameHintReadAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return Array.Empty<object?>();
+
+        var categories = ExtractLongs(payload)
+            .Select(value => (int)value)
+            .DefaultIfEmpty(0)
+            .Distinct()
+            .ToArray();
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await using (var command = new NpgsqlCommand(
+            """
+            update user_game_states
+            set has_unread_game_hint = false,
+                updated_at = now()
+            where "userId" = $1
+            """,
+            connection,
+            transaction))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var presentData = new List<object?>();
+        foreach (var category in categories)
+        {
+            var gameHintReadId = UserScopedId(userId.Value, 6600 + category);
+            await using var command = new NpgsqlCommand(
+                """
+                insert into user_game_hint_reads (id, "userId", category, is_read, read_at)
+                values ($1, $2, $3, true, now())
+                on conflict ("userId", category)
+                do update set is_read = true,
+                              read_at = now()
+                returning id
+                """,
+                connection,
+                transaction);
+            command.Parameters.AddWithValue(gameHintReadId);
+            command.Parameters.AddWithValue(userId.Value);
+            command.Parameters.AddWithValue(category);
+            var id = await command.ExecuteScalarAsync();
+            if (id is long)
+            {
+                presentData.Add(DataObject(66, new object?[] { gameHintReadId, category, true }));
+            }
+        }
+
+        await transaction.CommitAsync();
+        return presentData.ToArray();
+    }
+
+    public async Task<object?[]> GetStoryEventCampInfoAsync(HttpContext context)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        var publicId = userId is null ? "0000000000" : await ReadPublicIdAsync(userId.Value);
+        var rawRanking = new object?[] { 0, 0, publicId, 0 };
+        return new object?[] { rawRanking, 0L, 0L };
+    }
+
+    public async Task<object?[]> UpdateTutorialAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) return Array.Empty<object?>();
+
+        var tutorialStatus = ExtractFirstInt(payload) ?? 99;
+        await using var connection = await database.OpenConnectionAsync();
+        await using (var command = new NpgsqlCommand(
+            """
+            update user_game_states
+            set tutorial_status = $2,
+                is_tutorial_finished = $3,
+                updated_at = now()
+            where "userId" = $1
+            """,
+            connection))
+        {
+            command.Parameters.AddWithValue(userId.Value);
+            command.Parameters.AddWithValue(tutorialStatus);
+            command.Parameters.AddWithValue(tutorialStatus == 99);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var presentData = new List<object?>();
+        if (tutorialStatus == 99)
+        {
+            presentData.Add(DataObject(122, new object?[] { UserScopedId(userId.Value, 12201), 1, new DateTimeOffset(2026, 7, 21, 13, 0, 0, TimeSpan.FromHours(8)).UtcDateTime }));
+            presentData.Add(DataObject(150, new object?[] { UserScopedId(userId.Value, 15001), 1, DateTime.UtcNow.AddDays(4) }));
+        }
+
+        presentData.Add(DataObject(0, await ReadUserAsync(connection, userId.Value)));
+        return presentData.ToArray();
+    }
+
+    public async Task<object?[]> SetHomeBgmAsync(HttpContext context, long bgmMasterId, int selectionType, long? detailMasterId)
+    {
+        var userId = await GetCurrentUserIdAsync(context)
+            ?? throw new BadHttpRequestException(AccountErrors.Unauthorized, StatusCodes.Status401Unauthorized);
+        await EnsureDefaultUserDataAsync(userId);
+        await using var connection = await database.OpenConnectionAsync();
+
+        await using (var command = new NpgsqlCommand("""
+            insert into user_home_bgms ("userId", home_bgm_master_id, selection_type, home_bgm_detail_master_id)
+            values ($1, $2, $3, $4)
+            on conflict ("userId") do update set
+              home_bgm_master_id = excluded.home_bgm_master_id,
+              selection_type = excluded.selection_type,
+              home_bgm_detail_master_id = excluded.home_bgm_detail_master_id
+            """, connection))
+        {
+            command.Parameters.AddWithValue(userId);
+            command.Parameters.AddWithValue(bgmMasterId);
+            command.Parameters.AddWithValue(selectionType);
+            command.Parameters.AddWithValue(detailMasterId ?? bgmMasterId);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await using var read = new NpgsqlCommand("""
+            select home_bgm_master_id, selection_type, home_bgm_detail_master_id
+            from user_home_bgms where "userId" = $1
+            """, connection);
+        read.Parameters.AddWithValue(userId);
+        await using var reader = await read.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return new object?[] { reader.GetInt64(0), reader.GetInt32(1), reader.GetInt64(2) };
+    }
+
+    public async Task<object?[]> UpdateHomeDisplayPreferenceAsync(HttpContext context, object? payload)
+    {
+        var userId = await GetCurrentUserIdAsync(context);
+        if (userId is null) throw new BadHttpRequestException(AccountErrors.Unauthorized, StatusCodes.Status401Unauthorized);
+        if (payload is null)
+        {
+            await EnsureDefaultUserDataAsync(userId.Value);
+            await using var readConnection = await database.OpenConnectionAsync();
+            return await ReadHomeDisplayPreferenceAsync(readConnection, userId.Value);
+        }
+        if (payload is not object?[] { Length: 15 } values)
+            throw new BadHttpRequestException(HomeDisplayPreferenceRules.Invalid, StatusCodes.Status400BadRequest);
+        foreach (var index in new[] { 0, 2, 3, 4, 5, 7, 8, 9, 13, 14 })
+            if (values[index] is not null && GetLong(values, index) is null)
+                throw new BadHttpRequestException(HomeDisplayPreferenceRules.Invalid, StatusCodes.Status400BadRequest);
+
+        await EnsureDefaultUserDataAsync(userId.Value);
+        var characterBaseMasterId = GetLong(values, 0) ?? DefaultCharacterBaseMasterId;
+        var illustrationCharacterBaseMasterId = GetNullableLong(values, 1);
+        var subCharacterBaseMasterId1 = GetLong(values, 2) ?? DefaultCharacterBaseMasterId;
+        var subCharacterBaseMasterId2 = GetLong(values, 3) ?? DefaultCharacterBaseMasterId;
+        var subCharacterBaseMasterId3 = GetLong(values, 4) ?? DefaultCharacterBaseMasterId;
+        var costumeMasterId = HomeDisplayPreferenceRules.Costume(CharacterCatalog.Value, characterBaseMasterId, GetNullableLong(values, 5));
+        var illustrationCostumeMasterId = GetNullableLong(values, 6);
+        var subCostumeMasterId1 = GetNullableLong(values, 7);
+        var subCostumeMasterId2 = GetNullableLong(values, 8);
+        var subCostumeMasterId3 = GetNullableLong(values, 9);
+        var characterMasterId = GetLong(values, 10) ?? DefaultCharacterMasterId;
+        var isIllust = GetBool(values, 11) ?? false;
+        var displayType = (int)(GetLong(values, 12) ?? 0);
+        // 最后两个字段是「登录奖励用的角色/衣装」：衣装是 Spine 资源（另一套 ID 空间），
+        // 不能拿去普通衣装表校验，否则整段设置会保存失败。
+        var loginBonusCharacterBaseMasterId = GetLong(values, 13) ?? characterBaseMasterId;
+        var loginBonusCostumeMasterId = GetNullableLong(values, 14) ?? costumeMasterId;
+        _ = HomeDisplayPreferenceRules.Costume(CharacterCatalog.Value, subCharacterBaseMasterId1, subCostumeMasterId1);
+        _ = HomeDisplayPreferenceRules.Costume(CharacterCatalog.Value, subCharacterBaseMasterId2, subCostumeMasterId2);
+        _ = HomeDisplayPreferenceRules.Costume(CharacterCatalog.Value, subCharacterBaseMasterId3, subCostumeMasterId3);
+
+        await using var connection = await database.OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            insert into user_home_display_preferences (
+              "userId",
+              character_base_master_id,
+              illustration_character_base_master_id,
+              sub_character_base_master_id_1,
+              sub_character_base_master_id_2,
+              sub_character_base_master_id_3,
+              costume_master_id,
+              illustration_costume_master_id,
+              sub_costume_master_id_1,
+              sub_costume_master_id_2,
+              sub_costume_master_id_3,
+              character_master_id,
+              is_illust,
+              display_type,
+              login_bonus_character_base_master_id,
+              login_bonus_costume_master_id
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            on conflict ("userId") do update set
+              character_base_master_id = excluded.character_base_master_id,
+              illustration_character_base_master_id = excluded.illustration_character_base_master_id,
+              sub_character_base_master_id_1 = excluded.sub_character_base_master_id_1,
+              sub_character_base_master_id_2 = excluded.sub_character_base_master_id_2,
+              sub_character_base_master_id_3 = excluded.sub_character_base_master_id_3,
+              costume_master_id = excluded.costume_master_id,
+              illustration_costume_master_id = excluded.illustration_costume_master_id,
+              sub_costume_master_id_1 = excluded.sub_costume_master_id_1,
+              sub_costume_master_id_2 = excluded.sub_costume_master_id_2,
+              sub_costume_master_id_3 = excluded.sub_costume_master_id_3,
+              character_master_id = excluded.character_master_id,
+              is_illust = excluded.is_illust,
+              display_type = excluded.display_type,
+              login_bonus_character_base_master_id = excluded.login_bonus_character_base_master_id,
+              login_bonus_costume_master_id = excluded.login_bonus_costume_master_id
+            """,
+            connection);
+        command.Parameters.AddWithValue(userId.Value);
+        command.Parameters.AddWithValue(characterBaseMasterId);
+        command.Parameters.AddWithValue((object?)illustrationCharacterBaseMasterId ?? DBNull.Value);
+        command.Parameters.AddWithValue(subCharacterBaseMasterId1);
+        command.Parameters.AddWithValue(subCharacterBaseMasterId2);
+        command.Parameters.AddWithValue(subCharacterBaseMasterId3);
+        command.Parameters.AddWithValue(costumeMasterId);
+        command.Parameters.AddWithValue((object?)illustrationCostumeMasterId ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)subCostumeMasterId1 ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)subCostumeMasterId2 ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)subCostumeMasterId3 ?? DBNull.Value);
+        command.Parameters.AddWithValue(characterMasterId);
+        command.Parameters.AddWithValue(isIllust);
+        command.Parameters.AddWithValue(displayType);
+        command.Parameters.AddWithValue(loginBonusCharacterBaseMasterId);
+        command.Parameters.AddWithValue(loginBonusCostumeMasterId);
+        await command.ExecuteNonQueryAsync();
+
+        return await ReadHomeDisplayPreferenceAsync(connection, userId.Value);
+    }
+
+    static IEnumerable<long> ExtractLongs(object? value)
+    {
+        switch (value)
+        {
+            case long longValue:
+                yield return longValue;
+                yield break;
+            case int intValue:
+                yield return intValue;
+                yield break;
+            case short shortValue:
+                yield return shortValue;
+                yield break;
+            case byte byteValue:
+                yield return byteValue;
+                yield break;
+            case string text when long.TryParse(text, out var parsed):
+                yield return parsed;
+                yield break;
+            case object?[] array:
+                foreach (var item in array)
+                {
+                    foreach (var number in ExtractLongs(item))
+                    {
+                        yield return number;
+                    }
+                }
+                yield break;
+        }
+    }
+
+    static object?[] BuildUserProfileDetail(
+        string? publicId,
+        string displayName,
+        long mainCharacterMasterId,
+        int mainCharacterLevel,
+        bool characterDisplayAwakeningStatus,
+        long iconFrameMasterId,
+        long nameColorMasterId,
+        long nameBaseColorMasterId,
+        long? nameplateMasterId)
+    {
+        return new object?[]
+        {
+            publicId ?? "0000000000",
+            displayName,
+            null,
+            null,
+            null,
+            mainCharacterMasterId,
+            mainCharacterLevel,
+            characterDisplayAwakeningStatus,
+            iconFrameMasterId,
+            nameColorMasterId,
+            nameBaseColorMasterId,
+            nameplateMasterId,
+            null
+        };
+    }
+}
