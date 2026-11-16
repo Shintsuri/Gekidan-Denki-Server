@@ -126,7 +126,7 @@ docs/          進捗、リバースエンジニアリング記録
 - 商業利用は禁止です；
 - 配布時は `LICENSE` と著作権表示を残し、変更内容を明記してください。
 
-本プロジェクトはゲームのアセットやマスターデータを含みません。ゲームおよび関連素材の著作権は Project WDS と KMS.inc に帰属します。詳細は [LICENSE](LICENSE) と [NOTICE](NOTICE.md) を参照してください。
+本プロジェクトはゲームのアセットやマスターデータを含みません。ゲームおよび関連素材の著作権は ©Sirius/Project WDS と KMS.inc に帰属します。詳細は [LICENSE](LICENSE) と [NOTICE](NOTICE.md) を参照してください。
 
 ## 謝辞
 
