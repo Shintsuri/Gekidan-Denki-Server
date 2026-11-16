@@ -1,6 +1,6 @@
 # Yumeno-Kanae
 
-World Dai Star（ユメステ）私有服务器实现，C# / .NET 10。
+World Dai Star（ユメステ）服务端实现，C# / .NET 10。
 
 用于协议研究与客户端运行，不含任何游戏资源。
 
