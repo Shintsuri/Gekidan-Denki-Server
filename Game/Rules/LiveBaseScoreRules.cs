@@ -5,6 +5,8 @@ static class LiveBaseScoreRules
     {
         1 => 0.95d,
         2 => 0.97d,
+        3 => 1d,
+        4 or 5 => 1.05d,
         _ => 1d
     };
 
