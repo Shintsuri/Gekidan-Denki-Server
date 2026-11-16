@@ -1,6 +1,6 @@
 # Gekidan-Denki-Server
 
-> 项目名：**Gekidan-Denki-Server**）
+> 项目名：**Gekidan-Denki-Server**
 
 ユメステ服务端实现，C# / .NET 10。
 
