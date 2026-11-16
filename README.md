@@ -126,7 +126,7 @@ docs/          进度、逆向记录
 - 禁止任何商业用途；
 - 分发时需保留 `LICENSE` 与版权声明，并说明修改内容。
 
-本项目不包含任何游戏素材与主数据；游戏及相关素材版权归 Project WDS 与 KMS.inc 所有。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE.md)。
+本项目不包含任何游戏素材与主数据；游戏及相关素材版权归 ©Sirius/Project WDS 与 KMS.inc 所有。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE.md)。
 
 ## 鸣谢
 
