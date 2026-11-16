@@ -1,8 +1,10 @@
 # Gekidan-Denki-Server
 
+[中文](README.md) | [日本語](README.ja.md) | [English](README.en.md)
+
 非官方的《ワールドダイスター 夢のステラリウム》（ユメステ）本地服务端，使用 C#、ASP.NET Core 与 PostgreSQL 实现客户端所需的 API、实时通信与玩家数据持久化。
 
-# 注意
+> [!WARNING]
 > - 本项目仅面向学习、协议研究和个人测试，不隶属于游戏开发商或运营方，也不提供官方线上服务。
 > - 项目仍在开发中，已有接口不代表完整游戏功能；部分排行榜与接口仍为占位数据。
 
@@ -124,7 +126,7 @@ docs/          进度、逆向记录
 - 禁止任何商业用途；
 - 分发时需保留 `LICENSE` 与版权声明，并说明修改内容。
 
-本项目不包含任何游戏素材与主数据；游戏及相关素材版权归 Project WDS 与 KMS.Inc 所有。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE.md)。
+本项目不包含任何游戏素材与主数据；游戏及相关素材版权归 Project WDS 与 KMS.inc 所有。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE.md)。
 
 ## 鸣谢
 
