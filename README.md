@@ -2,7 +2,7 @@
 
 World Dai Star（ユメステ）私有服务器实现，C# / .NET 10。
 
-用于协议研究与单机运行，不含任何游戏资源。
+用于协议研究与客户端运行，不含任何游戏资源。
 
 ## 文档
 
@@ -37,8 +37,8 @@ C# / .NET 10、ASP.NET Core、gRPC、PostgreSQL、MessagePack、MasterMemory。
 
 早期独立实现的单文件版本已停止维护，见 [Yumeno-Kanae-Prototype](https://github.com/Shintsuri/Yumeno-Kanae-Prototype)。
 
-## 免责声明
+##免责声明
 
-仅用于学习与协议研究。不包含任何游戏资源。不得用于商业用途或公开运营。游戏及相关素材版权归原权利人所有。
+仅用于学习与协议研究。不包含任何游戏资源。不得用于商业用途。游戏及相关素材版权归 Project WDS 及KMS.inc所有。
 
 详见 [LICENSE](LICENSE)。
